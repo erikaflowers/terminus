@@ -10,11 +10,11 @@ import {
     renderHeaderElements,
 } from "@/app/block/blockutil";
 import { ColorPickerPopover } from "@/app/block/colorpicker";
-import { ConnectionButton } from "@/app/block/connectionbutton";
+import { TmuxDetachButton } from "@/app/block/tmuxdetach";
 import { setAgentPref } from "@/app/store/agents";
 import { DurableSessionFlyover } from "@/app/block/durable-session-flyover";
 import { ContextMenuModel } from "@/app/store/contextmenu";
-import { recordTEvent, refocusNode, WOS } from "@/app/store/global";
+import { atoms, recordTEvent, refocusNode, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
 import { uxCloseBlock } from "@/app/store/keymodel";
 import { RpcApi } from "@/app/store/wshclientapi";
@@ -295,13 +295,10 @@ const BlockFrame_Header = ({
     nodeModel,
     viewModel,
     preview,
-    connBtnRef,
     agentBtnRef,
-    changeConnModalAtom,
     changeAgentModalAtom,
     error,
 }: BlockFrameProps & {
-    changeConnModalAtom: jotai.PrimitiveAtom<boolean>;
     changeAgentModalAtom?: jotai.PrimitiveAtom<boolean>;
     error?: Error;
 }) => {
@@ -314,7 +311,6 @@ const BlockFrame_Header = ({
     const hideViewName = util.useAtomValueSafe(viewModel?.hideViewName);
     const magnified = jotai.useAtomValue(nodeModel.isMagnified);
     const prevMagifiedState = React.useRef(magnified);
-    const manageConnection = util.useAtomValueSafe(viewModel?.manageConnection);
     const manageAgent = util.useAtomValueSafe(viewModel?.manageAgent);
     const currentBgColor = util.useAtomValueSafe(viewModel?.currentBgColor);
     const dragHandleRef = preview ? null : nodeModel.dragHandleRef;
@@ -390,14 +386,28 @@ const BlockFrame_Header = ({
                     onReset={handleBgColorReset}
                 />
             )}
-            {manageConnection && (
-                <ConnectionButton
-                    ref={connBtnRef}
-                    key="connbutton"
-                    connection={blockData?.meta?.connection}
-                    changeConnModalAtom={changeConnModalAtom}
-                    isTerminalBlock={isTerminalBlock}
+            {isTerminalBlock && (
+                <TmuxDetachButton
+                    blockId={nodeModel.blockId}
+                    cwd={(blockData?.meta?.["cmd:cwd"] as string) ?? ""}
                 />
+            )}
+            {isTerminalBlock && (
+                <span
+                    className="inline-flex items-center justify-center flex-shrink-0 cursor-pointer rounded hover:bg-highlightbg"
+                    style={{ width: 24, height: 24, color: "var(--grey-text-color)", fontSize: 12 }}
+                    title="Restart shell"
+                    onClick={async () => {
+                        const tabId = globalStore.get(atoms.staticTabId);
+                        await RpcApi.ControllerResyncCommand(TabRpcClient, {
+                            tabid: tabId,
+                            blockid: nodeModel.blockId,
+                            forcerestart: true,
+                        });
+                    }}
+                >
+                    <i className="fa-sharp fa-solid fa-arrow-rotate-right" />
+                </span>
             )}
             {useTermHeader && termConfigedDurable != null && (
                 <DurableSessionFlyover

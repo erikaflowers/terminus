@@ -215,6 +215,7 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
     const [agents, setAgents] = React.useState<CrewAgent[]>([]);
     const [loading, setLoading] = React.useState(false);
     const [avatars, setAvatars] = React.useState<Record<string, string | null>>({});
+    const agentsPath = jotai.useAtomValue(globalConfigAtom, { store: globalStore }).agentsPath;
 
     const refreshSessions = React.useCallback(async () => {
         setLoading(true);
@@ -274,7 +275,7 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
             setAvatars(loaded);
         };
         loadAvatars();
-    }, []);
+    }, [agentsPath]);
 
     // Initial load + polling
     React.useEffect(() => {

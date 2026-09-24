@@ -4,13 +4,9 @@
 import { BlockModel } from "@/app/block/block-model";
 import { BlockFrame_Header } from "@/app/block/blockframe-header";
 import { blockViewToIcon, getViewIconElem } from "@/app/block/blockutil";
-import { ConnStatusOverlay } from "@/app/block/connstatusoverlay";
 import { ChangeAgentBlockModal } from "@/app/modals/agenttypeahead";
-import { ChangeConnectionBlockModal } from "@/app/modals/conntypeahead";
-import { atoms, getBlockComponentModel, getSettingsKeyAtom, globalStore, useBlockAtom, WOS } from "@/app/store/global";
+import { atoms, getSettingsKeyAtom, useBlockAtom, WOS } from "@/app/store/global";
 import { useTabModel } from "@/app/store/tab-model";
-import { RpcApi } from "@/app/store/wshclientapi";
-import { TabRpcClient } from "@/app/store/wshrpcutil";
 import { WorkspaceLayoutModel } from "@/app/workspace/workspace-layout-model";
 import { ErrorBoundary } from "@/element/errorboundary";
 import { NodeModel } from "@/layout/index";
@@ -94,15 +90,10 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
     const aiPanelVisible = jotai.useAtomValue(WorkspaceLayoutModel.getInstance().panelVisibleAtom);
     const viewIconUnion = util.useAtomValueSafe(viewModel?.viewIcon) ?? blockViewToIcon(blockData?.meta?.view);
     const customBg = util.useAtomValueSafe(viewModel?.blockBg);
-    const manageConnection = util.useAtomValueSafe(viewModel?.manageConnection);
     const manageAgent = util.useAtomValueSafe(viewModel?.manageAgent);
-    const changeConnModalAtom = useBlockAtom(nodeModel.blockId, "changeConn", () => {
-        return jotai.atom(false);
-    }) as jotai.PrimitiveAtom<boolean>;
     const changeAgentModalAtom = useBlockAtom(nodeModel.blockId, "changeAgent", () => {
         return jotai.atom(false);
     }) as jotai.PrimitiveAtom<boolean>;
-    const connModalOpen = jotai.useAtomValue(changeConnModalAtom);
     const agentModalOpen = jotai.useAtomValue(changeAgentModalAtom);
     const isMagnified = jotai.useAtomValue(nodeModel.isMagnified);
     const isEphemeral = jotai.useAtomValue(nodeModel.isEphemeral);
@@ -110,44 +101,8 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
     const magnifiedBlockBlur = jotai.useAtomValue(magnifiedBlockBlurAtom);
     const [magnifiedBlockOpacityAtom] = React.useState(() => getSettingsKeyAtom("window:magnifiedblockopacity"));
     const magnifiedBlockOpacity = jotai.useAtomValue(magnifiedBlockOpacityAtom);
-    const connBtnRef = React.useRef<HTMLDivElement>(null);
     const agentBtnRef = React.useRef<HTMLDivElement>(null);
     const noHeader = util.useAtomValueSafe(viewModel?.noHeader);
-
-    React.useEffect(() => {
-        if (!manageConnection) {
-            return;
-        }
-        const bcm = getBlockComponentModel(nodeModel.blockId);
-        if (bcm != null) {
-            bcm.openSwitchConnection = () => {
-                globalStore.set(changeConnModalAtom, true);
-            };
-        }
-        return () => {
-            const bcm = getBlockComponentModel(nodeModel.blockId);
-            if (bcm != null) {
-                bcm.openSwitchConnection = null;
-            }
-        };
-    }, [manageConnection]);
-    React.useEffect(() => {
-        // on mount, if manageConnection, call ConnEnsure
-        if (!manageConnection || blockData == null || preview) {
-            return;
-        }
-        const connName = blockData?.meta?.connection;
-        if (!util.isLocalConnName(connName)) {
-            console.log("ensure conn", nodeModel.blockId, connName);
-            RpcApi.ConnEnsureCommand(
-                TabRpcClient,
-                { connname: connName, logblockid: nodeModel.blockId },
-                { timeout: 60000 }
-            ).catch((e) => {
-                console.log("error ensuring connection", nodeModel.blockId, connName, e);
-            });
-        }
-    }, [manageConnection, blockData]);
 
     const viewIconElem = getViewIconElem(viewIconUnion, blockData);
     let innerStyle: React.CSSProperties = {};
@@ -159,9 +114,7 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
     const headerElem = (
         <BlockFrame_Header
             {...props}
-            connBtnRef={connBtnRef}
             agentBtnRef={agentBtnRef}
-            changeConnModalAtom={changeConnModalAtom}
             changeAgentModalAtom={changeAgentModalAtom}
         />
     );
@@ -195,27 +148,10 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
             inert={preview || undefined}
         >
             <BlockMask nodeModel={nodeModel} />
-            {preview || viewModel == null || !manageConnection ? null : (
-                <ConnStatusOverlay
-                    nodeModel={nodeModel}
-                    viewModel={viewModel}
-                    changeConnModalAtom={changeConnModalAtom}
-                />
-            )}
             <div className="block-frame-default-inner" style={innerStyle}>
                 {noHeader || <ErrorBoundary fallback={headerElemNoView}>{headerElem}</ErrorBoundary>}
                 {preview ? previewElem : children}
             </div>
-            {preview || viewModel == null || !connModalOpen ? null : (
-                <ChangeConnectionBlockModal
-                    blockId={nodeModel.blockId}
-                    nodeModel={nodeModel}
-                    viewModel={viewModel}
-                    blockRef={blockModel?.blockRef}
-                    changeConnModalAtom={changeConnModalAtom}
-                    connBtnRef={connBtnRef}
-                />
-            )}
             {preview || viewModel == null || !agentModalOpen ? null : (
                 <ChangeAgentBlockModal
                     blockId={nodeModel.blockId}

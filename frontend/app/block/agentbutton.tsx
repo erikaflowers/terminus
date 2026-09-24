@@ -1,7 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { getAgentInfo, loadAvatarDataUrl } from "@/app/store/agents";
+import { getAgentInfo, globalConfigAtom, loadAvatarDataUrl } from "@/app/store/agents";
 import { recordTEvent } from "@/app/store/global";
 import * as util from "@/util/util";
 import * as jotai from "jotai";
@@ -16,6 +16,7 @@ export const AgentButton = React.memo(
     React.forwardRef<HTMLDivElement, AgentButtonProps>(
         ({ agentName, changeAgentModalAtom }: AgentButtonProps, ref) => {
             const [, setAgentModalOpen] = jotai.useAtom(changeAgentModalAtom);
+            const agentsPath = jotai.useAtomValue(globalConfigAtom).agentsPath;
             const agentInfo = agentName ? getAgentInfo(agentName) : null;
             const color = agentInfo?.color ?? "var(--grey-text-color)";
             const displayName = agentInfo?.name ?? null;
@@ -29,7 +30,7 @@ export const AgentButton = React.memo(
                         if (url) setAvatarDataUrl(url);
                     });
                 }
-            }, [agentInfo?.avatarPath]);
+            }, [agentInfo?.avatarPath, agentsPath]);
 
             const clickHandler = function () {
                 recordTEvent("action:other", { "action:type": "agentdropdown", "action:initiator": "mouse" });
