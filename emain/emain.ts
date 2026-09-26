@@ -3,8 +3,6 @@
 
 import { RpcApi } from "@/app/store/wshclientapi";
 import * as electron from "electron";
-import * as fs from "fs";
-import * as path from "path";
 import { focusedBuilderWindow, getAllBuilderWindows } from "emain/emain-builder";
 import { globalEvents } from "emain/emain-events";
 import { sprintf } from "sprintf-js";
@@ -31,6 +29,7 @@ import {
 import { initIpcHandlers } from "./emain-ipc";
 import { log } from "./emain-log";
 import { initMenuEventSubscriptions, makeAndSetAppMenu, makeDockTaskbar } from "./emain-menu";
+import { pullAndWriteConfigs, readAuthState, refreshTokenIfNeeded } from "./emain-oauth";
 import {
     checkIfRunningUnderARM64Translation,
     getElectronAppBasePath,
@@ -56,7 +55,6 @@ import {
     WaveBrowserWindow,
 } from "./emain-window";
 import { ElectronWshClient, initElectronWshClient } from "./emain-wsh";
-import { readAuthState, pullConfigs } from "./emain-oauth";
 import { getLaunchSettings } from "./launchsettings";
 import { configureAutoUpdater, updater } from "./updater";
 
@@ -451,19 +449,15 @@ async function appMain() {
 
     // Cloud sync: pull configs on startup if logged in
     fireAndForget(async () => {
-        const auth = readAuthState();
+        let auth = readAuthState();
         if (!auth?.sync_enabled) return;
         try {
+            // refreshTokenIfNeeded persists the refreshed tokens to auth.json
+            auth = await refreshTokenIfNeeded(auth);
             const machineId = await getClientId();
-            const result = await pullConfigs(auth, machineId);
-            if (result.configs) {
-                for (const [key, data] of Object.entries(result.configs)) {
-                    if (!data || typeof data !== "object") continue;
-                    const filePath = path.join(waveConfigDir, `${key}.json`);
-                    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-                }
-                console.log("cloud sync: pulled configs on startup");
-            }
+            // Startup pull: don't clobber local files edited after the cloud copy was saved
+            const result = await pullAndWriteConfigs(auth, machineId, { skipNewerLocal: true });
+            console.log("cloud sync: pulled configs on startup, wrote:", result.written.join(", ") || "(none)");
         } catch (e) {
             console.log("cloud sync: pull on startup failed", e);
         }
