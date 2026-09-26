@@ -476,10 +476,14 @@ func getSystemSummary(ctx context.Context) string {
 	}
 }
 
+// job socket dir on remote machine (must be created before listening on a job socket)
+func GetRemoteJobSocketDir() string {
+	return filepath.Join("/tmp", fmt.Sprintf("terminus-%d", os.Getuid()))
+}
+
 // job socket path on remote machine
 func GetRemoteJobSocketPath(jobId string) string {
-	socketDir := filepath.Join("/tmp", fmt.Sprintf("terminus-%d", os.Getuid()))
-	return filepath.Join(socketDir, fmt.Sprintf("%s.sock", jobId))
+	return filepath.Join(GetRemoteJobSocketDir(), fmt.Sprintf("%s.sock", jobId))
 }
 
 // job file path on remote machine
