@@ -4,20 +4,21 @@
 import { BlockNodeModel } from "@/app/block/blocktypes";
 import {
     AgentColorTable,
+    buildTmuxAttachInitScript,
+    buildTmuxCommand,
+    getAgentDir,
     getAgentInfo,
     getAgentsPath,
-    getRemoteConfig,
-    getRepoBasePath,
-    getTmuxCmd,
-    loadAvatarDataUrl,
     globalConfigAtom,
+    loadAvatarDataUrl,
     resolveRemoteTmuxPath,
     setRemoteConfig,
     type AgentInfo,
 } from "@/app/store/agents";
-import { globalStore } from "@/app/store/jotaiStore";
 import { createBlock, getApi, WOS } from "@/app/store/global";
+import { globalStore } from "@/app/store/jotaiStore";
 import type { TabModel } from "@/app/store/tab-model";
+import { isSafeSessionName } from "@/util/shellquote";
 import * as jotai from "jotai";
 import * as React from "react";
 
@@ -69,6 +70,32 @@ function formatUptime(created: Date | null): string {
     if (days > 0) return `${days}d ${hours}h`;
     if (hours > 0) return `${hours}h ${mins}m`;
     return `${mins}m`;
+}
+
+// --- Tmux Commands ---
+
+// Session names come from AgentColorTable or from `tmux ls` output (possibly on the remote host),
+// so validate them and quote everything via the shellquote helpers.
+function buildNewAgentSessionCommand(agentKey: string): string | null {
+    if (!isSafeSessionName(agentKey)) {
+        console.warn("[crew] skipping unsafe session name", JSON.stringify(agentKey));
+        return null;
+    }
+    const args = ["new-session", "-d", "-s", agentKey];
+    const agentDir = getAgentDir(agentKey);
+    if (agentDir) {
+        args.push("-c", agentDir);
+    }
+    return buildTmuxCommand(args);
+}
+
+function buildKillSessionCommand(agentKey: string): string | null {
+    if (!isSafeSessionName(agentKey)) {
+        console.warn("[crew] skipping unsafe session name", JSON.stringify(agentKey));
+        return null;
+    }
+    // "=" makes tmux match the session name exactly instead of by prefix
+    return buildTmuxCommand(["kill-session", "-t", "=" + agentKey]);
 }
 
 // --- ViewModel ---
@@ -156,9 +183,7 @@ const AgentCard = React.memo(
                             }}
                         />
                         <span className="text-muted">
-                            {isRunning
-                                ? `running ${formatUptime(agent.session.created)}`
-                                : "stopped"}
+                            {isRunning ? `running ${formatUptime(agent.session.created)}` : "stopped"}
                         </span>
                     </div>
                 </div>
@@ -220,11 +245,7 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
     const refreshSessions = React.useCallback(async () => {
         setLoading(true);
         try {
-            const remote = getRemoteConfig();
-            const tmux = getTmuxCmd();
-            const cmd = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} "${tmux} ls"`
-                : `${tmux} ls`;
+            const cmd = buildTmuxCommand(["ls"]);
             const result = await getApi().execCommand(cmd);
             const sessions = parseTmuxLs(result.stdout);
             const sessionMap = new Map(sessions.map((s) => [s.name.toLowerCase(), s]));
@@ -284,40 +305,30 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
         return () => clearInterval(interval);
     }, [refreshSessions]);
 
-    const handleAttach = React.useCallback(
-        async (agentKey: string) => {
-            const info = getAgentInfo(agentKey);
-            const agentName = info?.name ?? agentKey;
-            const sessionName = agentKey.toLowerCase();
-            const remote = getRemoteConfig();
-            const tmux = getTmuxCmd();
-            const initScript = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} -t "${tmux} attach -t ${sessionName}"\n`
-                : `${tmux} attach -t ${sessionName}\n`;
-            const blockDef: BlockDef = {
-                meta: {
-                    view: "term",
-                    controller: "shell",
-                    "agent:name": agentName,
-                    "agent:color": info?.color ?? null,
-                    "agent:role": info?.role ?? null,
-                    "term:theme": info?.defaultTheme ?? null,
-                    "cmd:initscript.zsh": initScript,
-                },
-            };
-            await createBlock(blockDef);
-        },
-        []
-    );
+    const handleAttach = React.useCallback(async (agentKey: string) => {
+        const info = getAgentInfo(agentKey);
+        const agentName = info?.name ?? agentKey;
+        const sessionName = agentKey.toLowerCase();
+        const initScript = buildTmuxAttachInitScript(sessionName, getAgentDir(sessionName));
+        if (!initScript) return;
+        const blockDef: BlockDef = {
+            meta: {
+                view: "term",
+                controller: "shell",
+                "agent:name": agentName,
+                "agent:color": info?.color ?? null,
+                "agent:role": info?.role ?? null,
+                "term:theme": info?.defaultTheme ?? null,
+                "cmd:initscript.zsh": initScript,
+            },
+        };
+        await createBlock(blockDef);
+    }, []);
 
     const handleLaunch = React.useCallback(
         async (agentKey: string) => {
-            const agentDir = `${getAgentsPath()}/agent-${agentKey}`;
-            const remote = getRemoteConfig();
-            const tmux = getTmuxCmd();
-            const cmd = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} "${tmux} new-session -d -s ${agentKey} -c \\"${agentDir}\\""`
-                : `${tmux} new-session -d -s ${agentKey} -c "${agentDir}"`;
+            const cmd = buildNewAgentSessionCommand(agentKey);
+            if (!cmd) return;
             await getApi().execCommand(cmd);
             await refreshSessions();
         },
@@ -326,11 +337,8 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
 
     const handleSleep = React.useCallback(
         async (agentKey: string) => {
-            const remote = getRemoteConfig();
-            const tmux = getTmuxCmd();
-            const cmd = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} "${tmux} kill-session -t ${agentKey}"`
-                : `${tmux} kill-session -t ${agentKey}`;
+            const cmd = buildKillSessionCommand(agentKey);
+            if (!cmd) return;
             await getApi().execCommand(cmd);
             await refreshSessions();
         },
@@ -338,27 +346,20 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
     );
 
     const handleLaunchAll = React.useCallback(async () => {
-        const remote = getRemoteConfig();
-        const tmux = getTmuxCmd();
         const stopped = agents.filter((a) => !a.session);
         for (const agent of stopped) {
-            const agentDir = `${getAgentsPath()}/agent-${agent.key}`;
-            const cmd = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} "${tmux} new-session -d -s ${agent.key} -c \\"${agentDir}\\""`
-                : `${tmux} new-session -d -s ${agent.key} -c "${agentDir}"`;
+            const cmd = buildNewAgentSessionCommand(agent.key);
+            if (!cmd) continue;
             await getApi().execCommand(cmd);
         }
         await refreshSessions();
     }, [agents, refreshSessions]);
 
     const handleSleepAll = React.useCallback(async () => {
-        const remote = getRemoteConfig();
-        const tmux = getTmuxCmd();
         const running = agents.filter((a) => a.session);
         for (const agent of running) {
-            const cmd = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} "${tmux} kill-session -t ${agent.key}"`
-                : `${tmux} kill-session -t ${agent.key}`;
+            const cmd = buildKillSessionCommand(agent.key);
+            if (!cmd) continue;
             await getApi().execCommand(cmd);
         }
         await refreshSessions();
@@ -466,7 +467,12 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
                         value={hostInput}
                         onChange={(e) => setHostInput(e.target.value)}
                         onBlur={() => saveHost(hostInput)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { saveHost(hostInput); (e.target as HTMLInputElement).blur(); } }}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                                saveHost(hostInput);
+                                (e.target as HTMLInputElement).blur();
+                            }
+                        }}
                         placeholder="user@host (e.g. erik@100.64.79.114)"
                         className="text-[11px] px-2 py-1 rounded"
                         style={{
@@ -477,13 +483,20 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
                             width: "100%",
                         }}
                     />
-                    <label className="text-[10px] text-muted uppercase tracking-wider" style={{ marginTop: 4 }}>Repo Base Path</label>
+                    <label className="text-[10px] text-muted uppercase tracking-wider" style={{ marginTop: 4 }}>
+                        Repo Base Path
+                    </label>
                     <input
                         type="text"
                         value={repoPathInput}
                         onChange={(e) => setRepoPathInput(e.target.value)}
                         onBlur={() => saveRepoPath(repoPathInput)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { saveRepoPath(repoPathInput); (e.target as HTMLInputElement).blur(); } }}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                                saveRepoPath(repoPathInput);
+                                (e.target as HTMLInputElement).blur();
+                            }
+                        }}
                         placeholder={"/path/to/projects"}
                         className="text-[11px] px-2 py-1 rounded"
                         style={{
@@ -494,13 +507,20 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
                             width: "100%",
                         }}
                     />
-                    <label className="text-[10px] text-muted uppercase tracking-wider" style={{ marginTop: 4 }}>Remote Tmux Path</label>
+                    <label className="text-[10px] text-muted uppercase tracking-wider" style={{ marginTop: 4 }}>
+                        Remote Tmux Path
+                    </label>
                     <input
                         type="text"
                         value={tmuxPathInput}
                         onChange={(e) => setTmuxPathInput(e.target.value)}
                         onBlur={() => saveTmuxPath(tmuxPathInput)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { saveTmuxPath(tmuxPathInput); (e.target as HTMLInputElement).blur(); } }}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                                saveTmuxPath(tmuxPathInput);
+                                (e.target as HTMLInputElement).blur();
+                            }
+                        }}
                         placeholder="/opt/homebrew/bin/tmux (auto-detected)"
                         className="text-[11px] px-2 py-1 rounded"
                         style={{
@@ -551,7 +571,10 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
                     </div>
                 )}
                 {inactiveAgents.length > 0 && (
-                    <div className="flex flex-col gap-1" style={{ width: "100%", marginTop: activeAgents.length > 0 ? 8 : 0 }}>
+                    <div
+                        className="flex flex-col gap-1"
+                        style={{ width: "100%", marginTop: activeAgents.length > 0 ? 8 : 0 }}
+                    >
                         <span
                             className="text-[10px] font-semibold uppercase tracking-wider px-1 pb-0.5"
                             style={{ color: "#666" }}

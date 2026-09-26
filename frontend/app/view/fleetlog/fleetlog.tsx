@@ -5,6 +5,7 @@ import { BlockNodeModel } from "@/app/block/blocktypes";
 import { getGithubOrg, getRemoteConfig, getRepoBasePath, getTmuxCmd } from "@/app/store/agents";
 import { getApi, WOS } from "@/app/store/global";
 import type { TabModel } from "@/app/store/tab-model";
+import { isSafeSessionName, shellJoin, shellQuote, sshCommand } from "@/util/shellquote";
 import * as jotai from "jotai";
 import * as React from "react";
 
@@ -133,10 +134,15 @@ function deriveCommitUrl(projectDir: string | null, hash: string): string | null
 
 // --- Data Fetching ---
 
+// SQL string literal (values come from the DB, so escape quotes rather than trusting them)
+function sqlString(value: string): string {
+    return "'" + String(value ?? "").replace(/'/g, "''") + "'";
+}
+
 const FLEET_QUERY = `SELECT agent_name, session_id, timestamp, summary, last_commit_hash, last_commit_msg, project_dir FROM agent_logs ORDER BY id DESC LIMIT ${MAX_ENTRIES};`;
 
 async function fetchFleetEntries(): Promise<FleetEntry[]> {
-    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} "${FLEET_QUERY}"`;
+    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} ${shellQuote(FLEET_QUERY)}`;
     const result = await getApi().execCommand(cmd);
     if (!result.stdout || result.stdout.trim() === "") return [];
     try {
@@ -147,10 +153,13 @@ async function fetchFleetEntries(): Promise<FleetEntry[]> {
     }
 }
 
-async function fetchPrecedingUserMessage(sessionId: string, agentTimestamp: string): Promise<ConversationMessage | null> {
+async function fetchPrecedingUserMessage(
+    sessionId: string,
+    agentTimestamp: string
+): Promise<ConversationMessage | null> {
     // Get the most recent user message before this agent log's timestamp
-    const query = `SELECT session_id, agent_name, role, content, timestamp, sequence FROM conversation_messages WHERE session_id='${sessionId}' AND role='user' AND timestamp <= '${agentTimestamp}' ORDER BY sequence DESC LIMIT 1;`;
-    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} "${query}"`;
+    const query = `SELECT session_id, agent_name, role, content, timestamp, sequence FROM conversation_messages WHERE session_id=${sqlString(sessionId)} AND role='user' AND timestamp <= ${sqlString(agentTimestamp)} ORDER BY sequence DESC LIMIT 1;`;
+    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} ${shellQuote(query)}`;
     const result = await getApi().execCommand(cmd);
     if (!result.stdout || result.stdout.trim() === "") return null;
     try {
@@ -163,8 +172,8 @@ async function fetchPrecedingUserMessage(sessionId: string, agentTimestamp: stri
 }
 
 async function fetchFullConversation(sessionId: string): Promise<ConversationMessage[]> {
-    const query = `SELECT session_id, agent_name, role, content, timestamp, sequence FROM conversation_messages WHERE session_id='${sessionId}' ORDER BY sequence DESC;`;
-    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} "${query}"`;
+    const query = `SELECT session_id, agent_name, role, content, timestamp, sequence FROM conversation_messages WHERE session_id=${sqlString(sessionId)} ORDER BY sequence DESC;`;
+    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} ${shellQuote(query)}`;
     const result = await getApi().execCommand(cmd);
     if (!result.stdout || result.stdout.trim() === "") return [];
     try {
@@ -178,7 +187,7 @@ async function fetchFullConversation(sessionId: string): Promise<ConversationMes
 async function fetchUserViewMessages(): Promise<UserViewEntry[]> {
     // Get all user messages paired with the next assistant response
     const query = `SELECT u.session_id, u.agent_name, u.content as user_content, u.timestamp as user_timestamp, u.sequence as user_seq, a.content as assistant_content, a.timestamp as assistant_timestamp FROM conversation_messages u LEFT JOIN conversation_messages a ON a.session_id = u.session_id AND a.sequence = u.sequence + 1 AND a.role = 'assistant' WHERE u.role = 'user' ORDER BY u.timestamp DESC LIMIT ${MAX_ENTRIES};`;
-    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} "${query}"`;
+    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} ${shellQuote(query)}`;
     const result = await getApi().execCommand(cmd);
     if (!result.stdout || result.stdout.trim() === "") return [];
     try {
@@ -224,7 +233,7 @@ async function searchConversations(searchText: string): Promise<SearchResult[]> 
 
     // UNION both tables — conversation_messages + agent_logs summaries
     const query = `SELECT session_id, agent_name, role, content, timestamp, sequence FROM conversation_messages WHERE ${convWhere} UNION ALL SELECT session_id, agent_name, 'assistant' as role, summary as content, timestamp, 0 as sequence FROM agent_logs WHERE ${agentWhere} ORDER BY timestamp DESC LIMIT ${MAX_ENTRIES * 2};`;
-    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} "${query}"`;
+    const cmd = `/usr/bin/sqlite3 -json ${DB_PATH} ${shellQuote(query)}`;
     const result = await getApi().execCommand(cmd);
     if (!result.stdout || result.stdout.trim() === "") return [];
     try {
@@ -249,22 +258,34 @@ async function searchConversations(searchText: string): Promise<SearchResult[]> 
 
 // --- Send Reply to Agent ---
 
-async function sendReplyToAgent(
-    agentName: string,
-    text: string
-): Promise<{ ok: boolean; error?: string }> {
+async function sendReplyToAgent(agentName: string, text: string): Promise<{ ok: boolean; error?: string }> {
+    // agent_name comes from the fleet-log DB: never put an unvalidated one in a command
+    if (!isSafeSessionName(agentName)) {
+        console.warn("[fleetlog] refusing unsafe agent/session name", JSON.stringify(agentName));
+        return { ok: false, error: "invalid agent name" };
+    }
     const remote = getRemoteConfig();
     const tmux = getTmuxCmd();
+    const pasteAndSubmit =
+        shellJoin([tmux, "paste-buffer", "-t", agentName]) +
+        " && sleep 0.1 && " +
+        shellJoin([tmux, "send-keys", "-t", agentName, "Enter"]);
 
     let cmd: string;
     if (remote?.remoteHost) {
+        // Base64 encode to avoid shell escaping issues over SSH (`base64 -d` works on macOS and GNU)
         const bytes = new TextEncoder().encode(text);
-        const b64 = btoa(String.fromCharCode(...bytes));
-        const tmuxChain = `echo '${b64}' | base64 -D | ${tmux} load-buffer - && ${tmux} paste-buffer -t '${agentName}' && sleep 0.1 && ${tmux} send-keys -t '${agentName}' Enter`;
-        cmd = `ssh ${remote.remoteHost} "${tmuxChain}"`;
+        let bin = "";
+        for (let i = 0; i < bytes.length; i++) {
+            bin += String.fromCharCode(bytes[i]);
+        }
+        const b64 = btoa(bin);
+        const tmuxChain =
+            `printf '%s' ${shellQuote(b64)} | base64 -d | ${shellJoin([tmux, "load-buffer", "-"])} && ` +
+            pasteAndSubmit;
+        cmd = sshCommand(remote.remoteHost, ["sh", "-c", tmuxChain]);
     } else {
-        const escaped = text.replace(/'/g, "'\\''");
-        cmd = `${tmux} set-buffer '${escaped}' && ${tmux} paste-buffer -t '${agentName}' && sleep 0.1 && ${tmux} send-keys -t '${agentName}' Enter`;
+        cmd = shellJoin([tmux, "set-buffer", "--", text]) + " && " + pasteAndSubmit;
     }
 
     const result = await getApi().execCommand(cmd);
@@ -303,7 +324,12 @@ class FleetLogViewModel implements ViewModel {
 // --- Shared Reply Composer ---
 
 const ReplyComposer = React.memo(
-    ({ agentName, quotedSnippet, quoteLabel, onClose }: {
+    ({
+        agentName,
+        quotedSnippet,
+        quoteLabel,
+        onClose,
+    }: {
         agentName: string;
         quotedSnippet: string;
         quoteLabel: string;
@@ -408,10 +434,14 @@ const ReplyComposer = React.memo(
                     </span>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                         {sendResult === "sent" && (
-                            <span className="text-[9px] font-semibold" style={{ color: "#22C55E" }}>Sent!</span>
+                            <span className="text-[9px] font-semibold" style={{ color: "#22C55E" }}>
+                                Sent!
+                            </span>
                         )}
                         {sendResult && sendResult !== "sent" && (
-                            <span className="text-[9px]" style={{ color: "#EF4444" }}>{sendResult}</span>
+                            <span className="text-[9px]" style={{ color: "#EF4444" }}>
+                                {sendResult}
+                            </span>
                         )}
                         <button
                             onClick={onClose}
@@ -481,7 +511,10 @@ const CommitBadge = React.memo(
                     </span>
                 )}
                 {url && (
-                    <i className="fa-sharp fa-solid fa-arrow-up-right-from-square" style={{ fontSize: 8, opacity: 0.5 }} />
+                    <i
+                        className="fa-sharp fa-solid fa-arrow-up-right-from-square"
+                        style={{ fontSize: 8, opacity: 0.5 }}
+                    />
                 )}
             </span>
         );
@@ -554,10 +587,7 @@ const PrecedingUserMessage = React.memo(
                 }}
             >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span
-                        className="text-[9px] font-bold uppercase"
-                        style={{ color: "#6366F1", opacity: 0.7 }}
-                    >
+                    <span className="text-[9px] font-bold uppercase" style={{ color: "#6366F1", opacity: 0.7 }}>
                         You
                     </span>
                     <span className="text-[9px]" style={{ color: "var(--secondary-text-color)", opacity: 0.5 }}>
@@ -579,7 +609,12 @@ const PrecedingUserMessage = React.memo(
                         <span
                             onClick={() => setMsgExpanded(true)}
                             className="text-[9px]"
-                            style={{ color: "var(--secondary-text-color)", cursor: "pointer", marginLeft: 4, opacity: 0.6 }}
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                marginLeft: 4,
+                                opacity: 0.6,
+                            }}
                         >
                             ...more
                         </span>
@@ -588,7 +623,12 @@ const PrecedingUserMessage = React.memo(
                         <span
                             onClick={() => setMsgExpanded(false)}
                             className="text-[9px]"
-                            style={{ color: "var(--secondary-text-color)", cursor: "pointer", marginLeft: 4, opacity: 0.6 }}
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                marginLeft: 4,
+                                opacity: 0.6,
+                            }}
                         >
                             less
                         </span>
@@ -602,202 +642,191 @@ PrecedingUserMessage.displayName = "PrecedingUserMessage";
 
 // --- Fleet Entry Card (Agent View) ---
 
-const FleetEntryCard = React.memo(({ entry, onOpenChain }: { entry: FleetEntry; onOpenChain: (sessionId: string, agentName: string) => void }) => {
-    const [expanded, setExpanded] = React.useState(false);
-    const [showConvo, setShowConvo] = React.useState(false);
-    const [showReply, setShowReply] = React.useState(false);
-    const color = agentColor(entry.agent_name);
+const FleetEntryCard = React.memo(
+    ({ entry, onOpenChain }: { entry: FleetEntry; onOpenChain: (sessionId: string, agentName: string) => void }) => {
+        const [expanded, setExpanded] = React.useState(false);
+        const [showConvo, setShowConvo] = React.useState(false);
+        const [showReply, setShowReply] = React.useState(false);
+        const color = agentColor(entry.agent_name);
 
-    // Determine if summary needs truncation
-    const lines = entry.summary.split("\n");
-    const needsTruncation = lines.length > SUMMARY_LINE_LIMIT;
-    const displayText = expanded ? entry.summary : lines.slice(0, SUMMARY_LINE_LIMIT).join("\n");
-    const hasMore = needsTruncation && !expanded;
+        // Determine if summary needs truncation
+        const lines = entry.summary.split("\n");
+        const needsTruncation = lines.length > SUMMARY_LINE_LIMIT;
+        const displayText = expanded ? entry.summary : lines.slice(0, SUMMARY_LINE_LIMIT).join("\n");
+        const hasMore = needsTruncation && !expanded;
 
-    const hasSession = !!entry.session_id;
+        const hasSession = !!entry.session_id;
 
-    return (
-        <div
-            style={{
-                padding: "10px 12px",
-                borderRadius: 6,
-                background: "rgba(255,255,255,0.02)",
-                borderLeft: `3px solid ${color}`,
-                display: "flex",
-                flexDirection: "column",
-                gap: 6,
-            }}
-        >
-            {/* Header: agent name + timestamp + disclosure arrow */}
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    {hasSession && (
+        return (
+            <div
+                style={{
+                    padding: "10px 12px",
+                    borderRadius: 6,
+                    background: "rgba(255,255,255,0.02)",
+                    borderLeft: `3px solid ${color}`,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                }}
+            >
+                {/* Header: agent name + timestamp + disclosure arrow */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        {hasSession && (
+                            <span
+                                onClick={() => setShowConvo(!showConvo)}
+                                style={{
+                                    cursor: "pointer",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    width: 14,
+                                    height: 14,
+                                    flexShrink: 0,
+                                    transition: "transform 0.15s",
+                                    transform: showConvo ? "rotate(90deg)" : "rotate(0deg)",
+                                }}
+                            >
+                                <i
+                                    className="fa-sharp fa-solid fa-caret-right"
+                                    style={{ fontSize: 9, color: "var(--secondary-text-color)", opacity: 0.6 }}
+                                />
+                            </span>
+                        )}
                         <span
-                            onClick={() => setShowConvo(!showConvo)}
                             style={{
-                                cursor: "pointer",
-                                display: "inline-flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                width: 14,
-                                height: 14,
+                                width: 7,
+                                height: 7,
+                                borderRadius: "50%",
+                                background: color,
+                                display: "inline-block",
                                 flexShrink: 0,
-                                transition: "transform 0.15s",
-                                transform: showConvo ? "rotate(90deg)" : "rotate(0deg)",
                             }}
-                        >
-                            <i
-                                className="fa-sharp fa-solid fa-caret-right"
-                                style={{ fontSize: 9, color: "var(--secondary-text-color)", opacity: 0.6 }}
-                            />
+                        />
+                        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color }}>
+                            {entry.agent_name}
                         </span>
-                    )}
-                    <span
-                        style={{
-                            width: 7,
-                            height: 7,
-                            borderRadius: "50%",
-                            background: color,
-                            display: "inline-block",
-                            flexShrink: 0,
-                        }}
-                    />
-                    <span
-                        className="text-[11px] font-bold uppercase tracking-wide"
-                        style={{ color }}
-                    >
-                        {entry.agent_name}
-                    </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        {!showReply && (
+                            <span
+                                onClick={() => setShowReply(true)}
+                                className="text-[9px]"
+                                style={{
+                                    color: "var(--secondary-text-color)",
+                                    cursor: "pointer",
+                                    opacity: 0.5,
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 3,
+                                }}
+                            >
+                                <i className="fa-sharp fa-solid fa-reply" style={{ fontSize: 8 }} />
+                                reply
+                            </span>
+                        )}
+                        <span className="text-[10px]" style={{ color: "var(--secondary-text-color)", flexShrink: 0 }}>
+                            {formatRelativeTime(entry.timestamp)}
+                        </span>
+                    </div>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    {!showReply && (
+
+                {/* Summary */}
+                <div
+                    className="text-[11px]"
+                    style={{
+                        color: "var(--main-text-color)",
+                        opacity: 0.85,
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    {displayText}
+                    {hasMore && (
                         <span
-                            onClick={() => setShowReply(true)}
-                            className="text-[9px]"
+                            onClick={() => setExpanded(true)}
+                            className="text-[10px]"
                             style={{
                                 color: "var(--secondary-text-color)",
                                 cursor: "pointer",
-                                opacity: 0.5,
-                                display: "inline-flex",
-                                alignItems: "center",
-                                gap: 3,
+                                marginLeft: 4,
+                                opacity: 0.7,
                             }}
                         >
-                            <i className="fa-sharp fa-solid fa-reply" style={{ fontSize: 8 }} />
-                            reply
+                            ...show more
                         </span>
                     )}
-                    <span className="text-[10px]" style={{ color: "var(--secondary-text-color)", flexShrink: 0 }}>
-                        {formatRelativeTime(entry.timestamp)}
-                    </span>
+                    {expanded && needsTruncation && (
+                        <span
+                            onClick={() => setExpanded(false)}
+                            className="text-[10px]"
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                display: "inline-block",
+                                marginLeft: 4,
+                                opacity: 0.7,
+                            }}
+                        >
+                            show less
+                        </span>
+                    )}
                 </div>
-            </div>
 
-            {/* Summary */}
-            <div
-                className="text-[11px]"
-                style={{
-                    color: "var(--main-text-color)",
-                    opacity: 0.85,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    lineHeight: 1.5,
-                }}
-            >
-                {displayText}
-                {hasMore && (
-                    <span
-                        onClick={() => setExpanded(true)}
-                        className="text-[10px]"
-                        style={{
-                            color: "var(--secondary-text-color)",
-                            cursor: "pointer",
-                            marginLeft: 4,
-                            opacity: 0.7,
-                        }}
-                    >
-                        ...show more
-                    </span>
+                {/* Commit badge */}
+                {entry.last_commit_hash && (
+                    <div>
+                        <CommitBadge
+                            hash={entry.last_commit_hash}
+                            commitMsg={entry.last_commit_msg}
+                            projectDir={entry.project_dir}
+                        />
+                    </div>
                 )}
-                {expanded && needsTruncation && (
-                    <span
-                        onClick={() => setExpanded(false)}
-                        className="text-[10px]"
-                        style={{
-                            color: "var(--secondary-text-color)",
-                            cursor: "pointer",
-                            display: "inline-block",
-                            marginLeft: 4,
-                            opacity: 0.7,
-                        }}
-                    >
-                        show less
-                    </span>
-                )}
-            </div>
 
-            {/* Commit badge */}
-            {entry.last_commit_hash && (
-                <div>
-                    <CommitBadge
-                        hash={entry.last_commit_hash}
-                        commitMsg={entry.last_commit_msg}
-                        projectDir={entry.project_dir}
+                {/* Reply composer */}
+                {showReply && (
+                    <ReplyComposer
+                        agentName={entry.agent_name}
+                        quotedSnippet={entry.summary.length > 300 ? entry.summary.slice(0, 300) + "..." : entry.summary}
+                        quoteLabel={entry.session_id ? `[session ${entry.session_id}]` : ""}
+                        onClose={() => setShowReply(false)}
                     />
-                </div>
-            )}
+                )}
 
-            {/* Reply composer */}
-            {showReply && (
-                <ReplyComposer
-                    agentName={entry.agent_name}
-                    quotedSnippet={entry.summary.length > 300 ? entry.summary.slice(0, 300) + "..." : entry.summary}
-                    quoteLabel={entry.session_id ? `[session ${entry.session_id}]` : ""}
-                    onClose={() => setShowReply(false)}
-                />
-            )}
+                {/* Preceding user message — lazy loaded on disclosure */}
+                {showConvo && entry.session_id && (
+                    <PrecedingUserMessage sessionId={entry.session_id} agentTimestamp={entry.timestamp} />
+                )}
 
-            {/* Preceding user message — lazy loaded on disclosure */}
-            {showConvo && entry.session_id && (
-                <PrecedingUserMessage sessionId={entry.session_id} agentTimestamp={entry.timestamp} />
-            )}
-
-            {/* Full chain link */}
-            {hasSession && (
-                <span
-                    onClick={() => onOpenChain(entry.session_id!, entry.agent_name)}
-                    className="text-[9px]"
-                    style={{
-                        color: "var(--secondary-text-color)",
-                        cursor: "pointer",
-                        opacity: 0.5,
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 4,
-                        alignSelf: "flex-start",
-                    }}
-                >
-                    <i className="fa-sharp fa-solid fa-messages" style={{ fontSize: 8 }} />
-                    full conversation
-                </span>
-            )}
-        </div>
-    );
-});
+                {/* Full chain link */}
+                {hasSession && (
+                    <span
+                        onClick={() => onOpenChain(entry.session_id!, entry.agent_name)}
+                        className="text-[9px]"
+                        style={{
+                            color: "var(--secondary-text-color)",
+                            cursor: "pointer",
+                            opacity: 0.5,
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 4,
+                            alignSelf: "flex-start",
+                        }}
+                    >
+                        <i className="fa-sharp fa-solid fa-messages" style={{ fontSize: 8 }} />
+                        full conversation
+                    </span>
+                )}
+            </div>
+        );
+    }
+);
 FleetEntryCard.displayName = "FleetEntryCard";
 
 const AgentFilterChip = React.memo(
-    ({
-        name,
-        active,
-        count,
-        onToggle,
-    }: {
-        name: string;
-        active: boolean;
-        count: number;
-        onToggle: () => void;
-    }) => {
+    ({ name, active, count, onToggle }: { name: string; active: boolean; count: number; onToggle: () => void }) => {
         const color = agentColor(name);
         return (
             <button
@@ -823,174 +852,183 @@ AgentFilterChip.displayName = "AgentFilterChip";
 
 // --- User View Components ---
 
-const UserMessageCard = React.memo(({ entry, onOpenChain }: { entry: UserViewEntry; onOpenChain: (sessionId: string, agentName: string) => void }) => {
-    const color = agentColor(entry.agentName);
-    const [showAgentReply, setShowAgentReply] = React.useState(false);
-    const [showReplyComposer, setShowReplyComposer] = React.useState(false);
-    const [msgExpanded, setMsgExpanded] = React.useState(false);
+const UserMessageCard = React.memo(
+    ({ entry, onOpenChain }: { entry: UserViewEntry; onOpenChain: (sessionId: string, agentName: string) => void }) => {
+        const color = agentColor(entry.agentName);
+        const [showAgentReply, setShowAgentReply] = React.useState(false);
+        const [showReplyComposer, setShowReplyComposer] = React.useState(false);
+        const [msgExpanded, setMsgExpanded] = React.useState(false);
 
-    const userLines = entry.userContent.split("\n");
-    const needsTrunc = userLines.length > SUMMARY_LINE_LIMIT;
-    const displayText = msgExpanded ? entry.userContent : userLines.slice(0, SUMMARY_LINE_LIMIT).join("\n");
+        const userLines = entry.userContent.split("\n");
+        const needsTrunc = userLines.length > SUMMARY_LINE_LIMIT;
+        const displayText = msgExpanded ? entry.userContent : userLines.slice(0, SUMMARY_LINE_LIMIT).join("\n");
 
-    return (
-        <div
-            style={{
-                padding: "10px 12px",
-                borderRadius: 6,
-                background: "rgba(255,255,255,0.02)",
-                borderLeft: "3px solid #6366F1",
-                display: "flex",
-                flexDirection: "column",
-                gap: 6,
-            }}
-        >
-            {/* Header: "You → agent" + reply + timestamp */}
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    {entry.assistantContent && (
-                        <span
-                            onClick={() => setShowAgentReply(!showAgentReply)}
-                            style={{
-                                cursor: "pointer",
-                                display: "inline-flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                width: 14,
-                                height: 14,
-                                flexShrink: 0,
-                                transition: "transform 0.15s",
-                                transform: showAgentReply ? "rotate(90deg)" : "rotate(0deg)",
-                            }}
-                        >
-                            <i
-                                className="fa-sharp fa-solid fa-caret-right"
-                                style={{ fontSize: 9, color: "var(--secondary-text-color)", opacity: 0.6 }}
-                            />
+        return (
+            <div
+                style={{
+                    padding: "10px 12px",
+                    borderRadius: 6,
+                    background: "rgba(255,255,255,0.02)",
+                    borderLeft: "3px solid #6366F1",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                }}
+            >
+                {/* Header: "You → agent" + reply + timestamp */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        {entry.assistantContent && (
+                            <span
+                                onClick={() => setShowAgentReply(!showAgentReply)}
+                                style={{
+                                    cursor: "pointer",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    width: 14,
+                                    height: 14,
+                                    flexShrink: 0,
+                                    transition: "transform 0.15s",
+                                    transform: showAgentReply ? "rotate(90deg)" : "rotate(0deg)",
+                                }}
+                            >
+                                <i
+                                    className="fa-sharp fa-solid fa-caret-right"
+                                    style={{ fontSize: 9, color: "var(--secondary-text-color)", opacity: 0.6 }}
+                                />
+                            </span>
+                        )}
+                        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: "#6366F1" }}>
+                            You
                         </span>
-                    )}
-                    <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: "#6366F1" }}>
-                        You
-                    </span>
-                    <i
-                        className="fa-sharp fa-solid fa-arrow-right"
-                        style={{ fontSize: 8, color: "var(--secondary-text-color)", opacity: 0.4 }}
-                    />
-                    <span
-                        style={{
-                            width: 6,
-                            height: 6,
-                            borderRadius: "50%",
-                            background: color,
-                            display: "inline-block",
-                            flexShrink: 0,
-                        }}
-                    />
-                    <span className="text-[10px] font-semibold uppercase" style={{ color, opacity: 0.8 }}>
-                        {entry.agentName}
-                    </span>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    {!showReplyComposer && (
+                        <i
+                            className="fa-sharp fa-solid fa-arrow-right"
+                            style={{ fontSize: 8, color: "var(--secondary-text-color)", opacity: 0.4 }}
+                        />
                         <span
-                            onClick={() => setShowReplyComposer(true)}
-                            className="text-[9px]"
+                            style={{
+                                width: 6,
+                                height: 6,
+                                borderRadius: "50%",
+                                background: color,
+                                display: "inline-block",
+                                flexShrink: 0,
+                            }}
+                        />
+                        <span className="text-[10px] font-semibold uppercase" style={{ color, opacity: 0.8 }}>
+                            {entry.agentName}
+                        </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        {!showReplyComposer && (
+                            <span
+                                onClick={() => setShowReplyComposer(true)}
+                                className="text-[9px]"
+                                style={{
+                                    color: "var(--secondary-text-color)",
+                                    cursor: "pointer",
+                                    opacity: 0.5,
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 3,
+                                }}
+                            >
+                                <i className="fa-sharp fa-solid fa-reply" style={{ fontSize: 8 }} />
+                                reply
+                            </span>
+                        )}
+                        <span className="text-[10px]" style={{ color: "var(--secondary-text-color)", flexShrink: 0 }}>
+                            {formatRelativeTime(entry.userTimestamp)}
+                        </span>
+                    </div>
+                </div>
+
+                {/* User message content */}
+                <div
+                    className="text-[11px]"
+                    style={{
+                        color: "var(--main-text-color)",
+                        opacity: 0.85,
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    {displayText}
+                    {needsTrunc && !msgExpanded && (
+                        <span
+                            onClick={() => setMsgExpanded(true)}
+                            className="text-[10px]"
                             style={{
                                 color: "var(--secondary-text-color)",
                                 cursor: "pointer",
-                                opacity: 0.5,
-                                display: "inline-flex",
-                                alignItems: "center",
-                                gap: 3,
+                                marginLeft: 4,
+                                opacity: 0.7,
                             }}
                         >
-                            <i className="fa-sharp fa-solid fa-reply" style={{ fontSize: 8 }} />
-                            reply
+                            ...show more
                         </span>
                     )}
-                    <span className="text-[10px]" style={{ color: "var(--secondary-text-color)", flexShrink: 0 }}>
-                        {formatRelativeTime(entry.userTimestamp)}
-                    </span>
+                    {msgExpanded && needsTrunc && (
+                        <span
+                            onClick={() => setMsgExpanded(false)}
+                            className="text-[10px]"
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                display: "inline-block",
+                                marginLeft: 4,
+                                opacity: 0.7,
+                            }}
+                        >
+                            show less
+                        </span>
+                    )}
                 </div>
-            </div>
 
-            {/* User message content */}
-            <div
-                className="text-[11px]"
-                style={{
-                    color: "var(--main-text-color)",
-                    opacity: 0.85,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    lineHeight: 1.5,
-                }}
-            >
-                {displayText}
-                {needsTrunc && !msgExpanded && (
-                    <span
-                        onClick={() => setMsgExpanded(true)}
-                        className="text-[10px]"
-                        style={{ color: "var(--secondary-text-color)", cursor: "pointer", marginLeft: 4, opacity: 0.7 }}
-                    >
-                        ...show more
-                    </span>
+                {/* Agent reply — disclosed on click */}
+                {showAgentReply && entry.assistantContent && (
+                    <AgentReplyBlock
+                        agentName={entry.agentName}
+                        content={entry.assistantContent}
+                        timestamp={entry.assistantTimestamp}
+                    />
                 )}
-                {msgExpanded && needsTrunc && (
-                    <span
-                        onClick={() => setMsgExpanded(false)}
-                        className="text-[10px]"
-                        style={{
-                            color: "var(--secondary-text-color)",
-                            cursor: "pointer",
-                            display: "inline-block",
-                            marginLeft: 4,
-                            opacity: 0.7,
-                        }}
-                    >
-                        show less
-                    </span>
+
+                {/* Reply composer */}
+                {showReplyComposer && (
+                    <ReplyComposer
+                        agentName={entry.agentName}
+                        quotedSnippet={
+                            entry.userContent.length > 300 ? entry.userContent.slice(0, 300) + "..." : entry.userContent
+                        }
+                        quoteLabel={`[session ${entry.sessionId}]`}
+                        onClose={() => setShowReplyComposer(false)}
+                    />
                 )}
+
+                {/* Full chain link */}
+                <span
+                    onClick={() => onOpenChain(entry.sessionId, entry.agentName)}
+                    className="text-[9px]"
+                    style={{
+                        color: "var(--secondary-text-color)",
+                        cursor: "pointer",
+                        opacity: 0.5,
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 4,
+                        alignSelf: "flex-start",
+                    }}
+                >
+                    <i className="fa-sharp fa-solid fa-messages" style={{ fontSize: 8 }} />
+                    full conversation
+                </span>
             </div>
-
-            {/* Agent reply — disclosed on click */}
-            {showAgentReply && entry.assistantContent && (
-                <AgentReplyBlock
-                    agentName={entry.agentName}
-                    content={entry.assistantContent}
-                    timestamp={entry.assistantTimestamp}
-                />
-            )}
-
-            {/* Reply composer */}
-            {showReplyComposer && (
-                <ReplyComposer
-                    agentName={entry.agentName}
-                    quotedSnippet={entry.userContent.length > 300 ? entry.userContent.slice(0, 300) + "..." : entry.userContent}
-                    quoteLabel={`[session ${entry.sessionId}]`}
-                    onClose={() => setShowReplyComposer(false)}
-                />
-            )}
-
-            {/* Full chain link */}
-            <span
-                onClick={() => onOpenChain(entry.sessionId, entry.agentName)}
-                className="text-[9px]"
-                style={{
-                    color: "var(--secondary-text-color)",
-                    cursor: "pointer",
-                    opacity: 0.5,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 4,
-                    alignSelf: "flex-start",
-                }}
-            >
-                <i className="fa-sharp fa-solid fa-messages" style={{ fontSize: 8 }} />
-                full conversation
-            </span>
-        </div>
-    );
-});
+        );
+    }
+);
 UserMessageCard.displayName = "UserMessageCard";
 
 const AgentReplyBlock = React.memo(
@@ -1014,10 +1052,7 @@ const AgentReplyBlock = React.memo(
                 }}
             >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span
-                        className="text-[9px] font-bold uppercase"
-                        style={{ color, opacity: 0.7 }}
-                    >
+                    <span className="text-[9px] font-bold uppercase" style={{ color, opacity: 0.7 }}>
                         {agentName}
                     </span>
                     {timestamp && (
@@ -1041,7 +1076,12 @@ const AgentReplyBlock = React.memo(
                         <span
                             onClick={() => setReplyExpanded(true)}
                             className="text-[9px]"
-                            style={{ color: "var(--secondary-text-color)", cursor: "pointer", marginLeft: 4, opacity: 0.6 }}
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                marginLeft: 4,
+                                opacity: 0.6,
+                            }}
                         >
                             ...more
                         </span>
@@ -1050,7 +1090,12 @@ const AgentReplyBlock = React.memo(
                         <span
                             onClick={() => setReplyExpanded(false)}
                             className="text-[9px]"
-                            style={{ color: "var(--secondary-text-color)", cursor: "pointer", marginLeft: 4, opacity: 0.6 }}
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                marginLeft: 4,
+                                opacity: 0.6,
+                            }}
                         >
                             less
                         </span>
@@ -1065,7 +1110,11 @@ AgentReplyBlock.displayName = "AgentReplyBlock";
 // --- Search Result Card ---
 
 const SearchResultCard = React.memo(
-    ({ result, searchTerms, onOpenChain }: {
+    ({
+        result,
+        searchTerms,
+        onOpenChain,
+    }: {
         result: SearchResult;
         searchTerms: string[];
         onOpenChain: (sessionId: string, agentName: string) => void;
@@ -1114,10 +1163,7 @@ const SearchResultCard = React.memo(
                                 flexShrink: 0,
                             }}
                         />
-                        <span
-                            className="text-[11px] font-bold uppercase tracking-wide"
-                            style={{ color }}
-                        >
+                        <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color }}>
                             {isUser ? "You" : result.agent_name}
                         </span>
                         <span
@@ -1190,7 +1236,12 @@ const SearchResultCard = React.memo(
                         <span
                             onClick={() => setMsgExpanded(true)}
                             className="text-[10px]"
-                            style={{ color: "var(--secondary-text-color)", cursor: "pointer", marginLeft: 4, opacity: 0.7 }}
+                            style={{
+                                color: "var(--secondary-text-color)",
+                                cursor: "pointer",
+                                marginLeft: 4,
+                                opacity: 0.7,
+                            }}
                         >
                             ...show more
                         </span>
@@ -1216,7 +1267,9 @@ const SearchResultCard = React.memo(
                 {showReply && (
                     <ReplyComposer
                         agentName={result.agent_name}
-                        quotedSnippet={result.content.length > 300 ? result.content.slice(0, 300) + "..." : result.content}
+                        quotedSnippet={
+                            result.content.length > 300 ? result.content.slice(0, 300) + "..." : result.content
+                        }
                         quoteLabel={`[session ${result.session_id}, seq ${result.sequence}]`}
                         onClose={() => setShowReply(false)}
                     />
@@ -1270,10 +1323,7 @@ const FullChainMessage = React.memo(({ msg }: { msg: ConversationMessage }) => {
             }}
         >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span
-                    className="text-[10px] font-bold uppercase tracking-wide"
-                    style={{ color }}
-                >
+                <span className="text-[10px] font-bold uppercase tracking-wide" style={{ color }}>
                     {isUser ? "You" : msg.agent_name}
                 </span>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1376,10 +1426,7 @@ const FullChainView = React.memo(
                 style={{ background: "var(--block-bg-color)", flex: "1 1 0", minWidth: 0, height: "100%" }}
             >
                 {/* Chain header */}
-                <div
-                    className="flex items-center gap-3 px-3 py-2 border-b border-white/10"
-                    style={{ width: "100%" }}
-                >
+                <div className="flex items-center gap-3 px-3 py-2 border-b border-white/10" style={{ width: "100%" }}>
                     <button
                         onClick={onBack}
                         className="text-[11px] text-muted hover:text-white px-1.5 py-0.5 rounded"
@@ -1398,10 +1445,7 @@ const FullChainView = React.memo(
                             flexShrink: 0,
                         }}
                     />
-                    <span
-                        className="text-[12px] font-bold uppercase tracking-wide"
-                        style={{ color }}
-                    >
+                    <span className="text-[12px] font-bold uppercase tracking-wide" style={{ color }}>
                         {agentName}
                     </span>
                     <span className="text-[10px] text-muted">
@@ -1538,24 +1582,21 @@ const FleetLogView: React.FC<ViewComponentProps<FleetLogViewModel>> = ({ model }
         return userEntries.filter((e) => activeAgents.has(e.agentName));
     }, [userEntries, activeAgents]);
 
-    const handleToggleAgent = React.useCallback(
-        (name: string) => {
-            setActiveAgents((prev) => {
-                if (prev === null) {
-                    return new Set([name]);
-                }
-                const next = new Set(prev);
-                if (next.has(name)) {
-                    next.delete(name);
-                    return next.size === 0 ? null : next;
-                } else {
-                    next.add(name);
-                    return next;
-                }
-            });
-        },
-        []
-    );
+    const handleToggleAgent = React.useCallback((name: string) => {
+        setActiveAgents((prev) => {
+            if (prev === null) {
+                return new Set([name]);
+            }
+            const next = new Set(prev);
+            if (next.has(name)) {
+                next.delete(name);
+                return next.size === 0 ? null : next;
+            } else {
+                next.add(name);
+                return next;
+            }
+        });
+    }, []);
 
     const handleShowAll = React.useCallback(() => {
         setActiveAgents(null);
@@ -1589,7 +1630,12 @@ const FleetLogView: React.FC<ViewComponentProps<FleetLogViewModel>> = ({ model }
         );
     }
 
-    const displayCount = viewMode === "agent" ? filteredEntries.length : viewMode === "user" ? filteredUserEntries.length : searchResults.length;
+    const displayCount =
+        viewMode === "agent"
+            ? filteredEntries.length
+            : viewMode === "user"
+              ? filteredUserEntries.length
+              : searchResults.length;
     const chipCounts = viewMode === "agent" ? agentCounts : userAgentCounts;
 
     return (
@@ -1614,7 +1660,12 @@ const FleetLogView: React.FC<ViewComponentProps<FleetLogViewModel>> = ({ model }
                         <button
                             onClick={refresh}
                             className="text-[11px] text-muted hover:text-white px-1.5 py-0.5 rounded"
-                            style={{ background: "rgba(255,255,255,0.05)", cursor: "pointer", border: "none", marginLeft: 4 }}
+                            style={{
+                                background: "rgba(255,255,255,0.05)",
+                                cursor: "pointer",
+                                border: "none",
+                                marginLeft: 4,
+                            }}
                             title="Refresh"
                         >
                             <i className={`fa-sharp fa-solid fa-arrows-rotate ${loading ? "fa-spin" : ""}`} />
@@ -1722,7 +1773,11 @@ const FleetLogView: React.FC<ViewComponentProps<FleetLogViewModel>> = ({ model }
                             </div>
                         )}
                         {filteredEntries.map((entry, i) => (
-                            <FleetEntryCard key={`${entry.timestamp}-${entry.agent_name}-${i}`} entry={entry} onOpenChain={handleOpenChain} />
+                            <FleetEntryCard
+                                key={`${entry.timestamp}-${entry.agent_name}-${i}`}
+                                entry={entry}
+                                onOpenChain={handleOpenChain}
+                            />
                         ))}
                     </>
                 )}
@@ -1738,7 +1793,11 @@ const FleetLogView: React.FC<ViewComponentProps<FleetLogViewModel>> = ({ model }
                             </div>
                         )}
                         {filteredUserEntries.map((entry, i) => (
-                            <UserMessageCard key={`${entry.userTimestamp}-${entry.agentName}-${i}`} entry={entry} onOpenChain={handleOpenChain} />
+                            <UserMessageCard
+                                key={`${entry.userTimestamp}-${entry.agentName}-${i}`}
+                                entry={entry}
+                                onOpenChain={handleOpenChain}
+                            />
                         ))}
                     </>
                 )}
