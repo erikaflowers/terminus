@@ -4,6 +4,7 @@
 import { BlockNodeModel } from "@/app/block/blocktypes";
 import { getApi, WOS } from "@/app/store/global";
 import type { TabModel } from "@/app/store/tab-model";
+import { shellQuote } from "@/util/shellquote";
 import * as jotai from "jotai";
 import * as React from "react";
 
@@ -130,23 +131,33 @@ function shortModelName(model: string): string {
 
 // --- Data Fetching ---
 
-async function loadApiKey(): Promise<string | null> {
-    const configDir = getApi().getConfigDir();
-    const raw = await getApi().readTextFile(configDir + "/" + KEY_FILE);
-    return raw ? raw.trim() : null;
+function apiKeyPath(): string {
+    return getApi().getConfigDir() + "/" + KEY_FILE;
 }
 
-function buildCurlCmd(apiKey: string, endpoint: string, params: [string, string][]): string {
+/** Returns the path of the key file if it holds a usable key, else null. The key itself never leaves this function. */
+async function loadApiKey(): Promise<string | null> {
+    const keyPath = apiKeyPath();
+    const raw = await getApi().readTextFile(keyPath);
+    const key = raw ? raw.trim() : "";
+    // Must fit on one curl config line: no quotes, backslashes, or whitespace.
+    if (!key || /["\\\s]/.test(key)) return null;
+    return keyPath;
+}
+
+function buildCurlCmd(keyPath: string, endpoint: string, params: [string, string][]): string {
     // Build query string manually to preserve literal [] brackets (URLSearchParams encodes them as %5B%5D)
     const qs = params.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
     const url = qs ? `${API_BASE}${endpoint}?${qs}` : `${API_BASE}${endpoint}`;
-    const escapedKey = apiKey.replace(/'/g, "'\\''");
-    return `curl -s '${url}' -H 'anthropic-version: ${API_VERSION}' -H 'x-api-key: ${escapedKey}'`;
+    // The x-api-key header is fed to curl as a config file on stdin, built by shell builtins reading the
+    // key file, so the key never appears in any process's argv (visible in `ps`) or in this command string.
+    const header = `{ printf '%s' 'header = "x-api-key: '; tr -d ' \\t\\r\\n' < ${shellQuote(keyPath)}; printf '"\\n'; }`;
+    return `${header} | curl -s --max-time 9 --config - ${shellQuote(url)} -H ${shellQuote(`anthropic-version: ${API_VERSION}`)}`;
 }
 
-async function fetchCostReport(apiKey: string, range: TimeRange): Promise<CostBucket[]> {
+async function fetchCostReport(keyPath: string, range: TimeRange): Promise<CostBucket[]> {
     const { startingAt, endingAt } = getTimeRangeParams(range);
-    const cmd = buildCurlCmd(apiKey, "/v1/organizations/cost_report", [
+    const cmd = buildCurlCmd(keyPath, "/v1/organizations/cost_report", [
         ["starting_at", startingAt],
         ["ending_at", endingAt],
         ["bucket_width", "1d"],
@@ -154,9 +165,9 @@ async function fetchCostReport(apiKey: string, range: TimeRange): Promise<CostBu
     ]);
 
     const result = await getApi().execCommand(cmd);
-    if (!result.stdout) {
-        console.error("[usage] cost_report: empty stdout, stderr:", result.stderr);
-        return [];
+    if (result.code !== 0 || !result.stdout) {
+        console.error("[usage] cost_report failed, code:", result.code);
+        throw new Error(`Cost API request failed (exit ${result.code}${result.stdout ? "" : ", empty response"})`);
     }
 
     const json = JSON.parse(result.stdout);
@@ -187,9 +198,9 @@ async function fetchCostReport(apiKey: string, range: TimeRange): Promise<CostBu
     return buckets;
 }
 
-async function fetchUsageReport(apiKey: string, range: TimeRange): Promise<{ byModel: ModelUsageSummary[] }> {
+async function fetchUsageReport(keyPath: string, range: TimeRange): Promise<{ byModel: ModelUsageSummary[] }> {
     const { startingAt, endingAt } = getTimeRangeParams(range);
-    const cmd = buildCurlCmd(apiKey, "/v1/organizations/usage_report/messages", [
+    const cmd = buildCurlCmd(keyPath, "/v1/organizations/usage_report/messages", [
         ["starting_at", startingAt],
         ["ending_at", endingAt],
         ["bucket_width", "1d"],
@@ -197,9 +208,9 @@ async function fetchUsageReport(apiKey: string, range: TimeRange): Promise<{ byM
     ]);
 
     const result = await getApi().execCommand(cmd);
-    if (!result.stdout) {
-        console.error("[usage] usage_report: empty stdout, stderr:", result.stderr);
-        return { byModel: [] };
+    if (result.code !== 0 || !result.stdout) {
+        console.error("[usage] usage_report failed, code:", result.code);
+        throw new Error(`Usage API request failed (exit ${result.code}${result.stdout ? "" : ", empty response"})`);
     }
 
     const json = JSON.parse(result.stdout);
@@ -207,7 +218,12 @@ async function fetchUsageReport(apiKey: string, range: TimeRange): Promise<{ byM
         console.error("[usage] usage_report API error:", json.error);
         throw new Error(`Usage API: ${json.error?.message || JSON.stringify(json.error)}`);
     }
-    console.log("[usage] usage_report buckets:", json.data?.length, "first:", JSON.stringify(json.data?.[0])?.slice(0, 300));
+    console.log(
+        "[usage] usage_report buckets:",
+        json.data?.length,
+        "first:",
+        JSON.stringify(json.data?.[0])?.slice(0, 300)
+    );
 
     const modelMap = new Map<string, ModelUsageSummary>();
 
@@ -230,18 +246,19 @@ async function fetchUsageReport(apiKey: string, range: TimeRange): Promise<{ byM
             entry.outputTokens += r.output_tokens || 0;
             entry.cacheReadTokens += r.cache_read_input_tokens || 0;
             const cacheCreation = r.cache_creation || {};
-            entry.cacheCreationTokens += (cacheCreation.ephemeral_1h_input_tokens || 0) + (cacheCreation.ephemeral_5m_input_tokens || 0);
+            entry.cacheCreationTokens +=
+                (cacheCreation.ephemeral_1h_input_tokens || 0) + (cacheCreation.ephemeral_5m_input_tokens || 0);
         }
     }
 
     return { byModel: Array.from(modelMap.values()) };
 }
 
-async function fetchClaudeCodeMetrics(apiKey: string): Promise<ClaudeCodeMetrics | null> {
+async function fetchClaudeCodeMetrics(keyPath: string): Promise<ClaudeCodeMetrics | null> {
     // Claude Code analytics is daily — fetch today
     const now = new Date();
     const dateStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-${String(now.getUTCDate()).padStart(2, "0")}`;
-    const cmd = buildCurlCmd(apiKey, "/v1/organizations/usage_report/claude_code", [
+    const cmd = buildCurlCmd(keyPath, "/v1/organizations/usage_report/claude_code", [
         ["starting_at", dateStr],
         ["limit", "100"],
     ]);
@@ -288,8 +305,8 @@ async function fetchClaudeCodeMetrics(apiKey: string): Promise<ClaudeCodeMetrics
     return metrics;
 }
 
-async function fetchOrgName(apiKey: string): Promise<string> {
-    const cmd = buildCurlCmd(apiKey, "/v1/organizations/me", []);
+async function fetchOrgName(keyPath: string): Promise<string> {
+    const cmd = buildCurlCmd(keyPath, "/v1/organizations/me", []);
     const result = await getApi().execCommand(cmd);
     console.log("[usage] org/me response:", result.stdout?.slice(0, 200), "stderr:", result.stderr?.slice(0, 200));
     try {
@@ -305,12 +322,12 @@ async function fetchOrgName(apiKey: string): Promise<string> {
     }
 }
 
-async function fetchAllData(apiKey: string, range: TimeRange): Promise<UsageData> {
+async function fetchAllData(keyPath: string, range: TimeRange): Promise<UsageData> {
     try {
         const [costBuckets, usageReport, orgName] = await Promise.all([
-            fetchCostReport(apiKey, range),
-            fetchUsageReport(apiKey, range),
-            fetchOrgName(apiKey),
+            fetchCostReport(keyPath, range),
+            fetchUsageReport(keyPath, range),
+            fetchOrgName(keyPath),
         ]);
         const claudeCode: ClaudeCodeMetrics | null = null; // disabled: only tracks org API usage, not Max plan
 
@@ -412,35 +429,33 @@ class UsageViewModel implements ViewModel {
 
 // --- Components ---
 
-const SummaryCard = React.memo(
-    ({ label, value, sub }: { label: string; value: string; sub?: string }) => (
+const SummaryCard = React.memo(({ label, value, sub }: { label: string; value: string; sub?: string }) => (
+    <div
+        style={{
+            flex: "1 1 0",
+            minWidth: 0,
+            padding: "10px 12px",
+            borderRadius: 6,
+            background: "rgba(255,255,255,0.04)",
+            border: "1px solid rgba(255,255,255,0.08)",
+        }}
+    >
         <div
-            style={{
-                flex: "1 1 0",
-                minWidth: 0,
-                padding: "10px 12px",
-                borderRadius: 6,
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.08)",
-            }}
+            className="text-[10px] font-semibold uppercase tracking-wider"
+            style={{ color: "var(--secondary-text-color)", marginBottom: 4 }}
         >
-            <div
-                className="text-[10px] font-semibold uppercase tracking-wider"
-                style={{ color: "var(--secondary-text-color)", marginBottom: 4 }}
-            >
-                {label}
-            </div>
-            <div className="text-[18px] font-bold" style={{ color: "var(--main-text-color)" }}>
-                {value}
-            </div>
-            {sub && (
-                <div className="text-[10px]" style={{ color: "var(--secondary-text-color)", marginTop: 2 }}>
-                    {sub}
-                </div>
-            )}
+            {label}
         </div>
-    )
-);
+        <div className="text-[18px] font-bold" style={{ color: "var(--main-text-color)" }}>
+            {value}
+        </div>
+        {sub && (
+            <div className="text-[10px]" style={{ color: "var(--secondary-text-color)", marginTop: 2 }}>
+                {sub}
+            </div>
+        )}
+    </div>
+));
 SummaryCard.displayName = "SummaryCard";
 
 const CostBar = React.memo(({ pct, color }: { pct: number; color: string }) => (
@@ -549,12 +564,16 @@ const ClaudeCodeSection = React.memo(({ metrics }: { metrics: ClaudeCodeMetrics 
                 <div style={{ display: "flex", gap: 12, marginTop: 2 }}>
                     <span className="text-[10px]" style={{ color: "var(--secondary-text-color)" }}>
                         Edit accept: <span style={{ color: "var(--main-text-color)" }}>{editRate}%</span>{" "}
-                        <span style={{ opacity: 0.5 }}>({metrics.editAccepted}/{editTotal})</span>
+                        <span style={{ opacity: 0.5 }}>
+                            ({metrics.editAccepted}/{editTotal})
+                        </span>
                     </span>
                     {writeTotal > 0 && (
                         <span className="text-[10px]" style={{ color: "var(--secondary-text-color)" }}>
                             Write accept: <span style={{ color: "var(--main-text-color)" }}>{writeRate}%</span>{" "}
-                            <span style={{ opacity: 0.5 }}>({metrics.writeAccepted}/{writeTotal})</span>
+                            <span style={{ opacity: 0.5 }}>
+                                ({metrics.writeAccepted}/{writeTotal})
+                            </span>
                         </span>
                     )}
                 </div>
@@ -564,70 +583,66 @@ const ClaudeCodeSection = React.memo(({ metrics }: { metrics: ClaudeCodeMetrics 
 });
 ClaudeCodeSection.displayName = "ClaudeCodeSection";
 
-const StatChip = React.memo(
-    ({ label, value, color }: { label: string; value: string; color?: string }) => (
-        <div
-            style={{
-                padding: "3px 8px",
-                borderRadius: 4,
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.06)",
-            }}
-        >
-            <span className="text-[9px] uppercase" style={{ color: "var(--secondary-text-color)" }}>
-                {label}{" "}
-            </span>
-            <span className="text-[11px] font-semibold" style={{ color: color || "var(--main-text-color)" }}>
-                {value}
-            </span>
-        </div>
-    )
-);
+const StatChip = React.memo(({ label, value, color }: { label: string; value: string; color?: string }) => (
+    <div
+        style={{
+            padding: "3px 8px",
+            borderRadius: 4,
+            background: "rgba(255,255,255,0.04)",
+            border: "1px solid rgba(255,255,255,0.06)",
+        }}
+    >
+        <span className="text-[9px] uppercase" style={{ color: "var(--secondary-text-color)" }}>
+            {label}{" "}
+        </span>
+        <span className="text-[11px] font-semibold" style={{ color: color || "var(--main-text-color)" }}>
+            {value}
+        </span>
+    </div>
+));
 StatChip.displayName = "StatChip";
 
-const DailyBar = React.memo(
-    ({ costs, maxCost }: { costs: { date: string; costCents: number }[]; maxCost: number }) => {
-        if (costs.length === 0) return null;
-        return (
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <div
-                    className="text-[10px] font-semibold uppercase tracking-wider"
-                    style={{ color: "var(--secondary-text-color)" }}
-                >
-                    Daily Cost
-                </div>
-                <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 40 }}>
-                    {costs.map((d) => {
-                        const h = maxCost > 0 ? Math.max(2, (d.costCents / maxCost) * 36) : 2;
-                        return (
-                            <div
-                                key={d.date}
-                                title={`${d.date}: ${formatCost(d.costCents)}`}
-                                style={{
-                                    flex: "1 1 0",
-                                    height: h,
-                                    borderRadius: 2,
-                                    background: "#a78bfa",
-                                    opacity: 0.7,
-                                    minWidth: 3,
-                                    transition: "height 0.3s ease",
-                                }}
-                            />
-                        );
-                    })}
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span className="text-[9px]" style={{ color: "var(--secondary-text-color)" }}>
-                        {costs[0]?.date}
-                    </span>
-                    <span className="text-[9px]" style={{ color: "var(--secondary-text-color)" }}>
-                        {costs[costs.length - 1]?.date}
-                    </span>
-                </div>
+const DailyBar = React.memo(({ costs, maxCost }: { costs: { date: string; costCents: number }[]; maxCost: number }) => {
+    if (costs.length === 0) return null;
+    return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <div
+                className="text-[10px] font-semibold uppercase tracking-wider"
+                style={{ color: "var(--secondary-text-color)" }}
+            >
+                Daily Cost
             </div>
-        );
-    }
-);
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 40 }}>
+                {costs.map((d) => {
+                    const h = maxCost > 0 ? Math.max(2, (d.costCents / maxCost) * 36) : 2;
+                    return (
+                        <div
+                            key={d.date}
+                            title={`${d.date}: ${formatCost(d.costCents)}`}
+                            style={{
+                                flex: "1 1 0",
+                                height: h,
+                                borderRadius: 2,
+                                background: "#a78bfa",
+                                opacity: 0.7,
+                                minWidth: 3,
+                                transition: "height 0.3s ease",
+                            }}
+                        />
+                    );
+                })}
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span className="text-[9px]" style={{ color: "var(--secondary-text-color)" }}>
+                    {costs[0]?.date}
+                </span>
+                <span className="text-[9px]" style={{ color: "var(--secondary-text-color)" }}>
+                    {costs[costs.length - 1]?.date}
+                </span>
+            </div>
+        </div>
+    );
+});
 DailyBar.displayName = "DailyBar";
 
 // --- Setup View (no API key) ---
@@ -635,10 +650,7 @@ DailyBar.displayName = "DailyBar";
 const SetupView = React.memo(({ onRefresh }: { onRefresh?: () => void }) => {
     const configDir = getApi().getConfigDir();
     return (
-        <div
-            className="flex flex-col items-center justify-center"
-            style={{ height: "100%", gap: 12, padding: 24 }}
-        >
+        <div className="flex flex-col items-center justify-center" style={{ height: "100%", gap: 12, padding: 24 }}>
             <i
                 className="fa-sharp fa-solid fa-key"
                 style={{ fontSize: 24, color: "var(--secondary-text-color)", opacity: 0.5 }}
@@ -695,17 +707,22 @@ const UsageView: React.FC<ViewComponentProps<UsageViewModel>> = ({ model }) => {
     const [loading, setLoading] = React.useState(false);
     const [range, setRange] = React.useState<TimeRange>("7d");
     const [hasKey, setHasKey] = React.useState<boolean | null>(null);
+    const requestIdRef = React.useRef(0);
 
     const refresh = React.useCallback(async () => {
+        // A late response for an older range/refresh must not overwrite a newer one.
+        const requestId = ++requestIdRef.current;
         setLoading(true);
-        const key = await loadApiKey();
-        if (!key) {
+        const keyPath = await loadApiKey();
+        if (requestId !== requestIdRef.current) return;
+        if (!keyPath) {
             setHasKey(false);
             setLoading(false);
             return;
         }
         setHasKey(true);
-        const result = await fetchAllData(key, range);
+        const result = await fetchAllData(keyPath, range);
+        if (requestId !== requestIdRef.current) return;
         setData(result);
         setLoading(false);
     }, [range]);
@@ -740,9 +757,7 @@ const UsageView: React.FC<ViewComponentProps<UsageViewModel>> = ({ model }) => {
             >
                 <div className="flex items-center gap-2">
                     <span className="text-[12px] font-semibold text-muted uppercase tracking-wider">Usage</span>
-                    {data?.orgName && (
-                        <span className="text-[11px] text-muted">{data.orgName}</span>
-                    )}
+                    {data?.orgName && <span className="text-[11px] text-muted">{data.orgName}</span>}
                 </div>
                 <div className="flex items-center gap-2">
                     {/* Time range selector */}
@@ -781,14 +796,18 @@ const UsageView: React.FC<ViewComponentProps<UsageViewModel>> = ({ model }) => {
                 {data?.error && (
                     <div
                         className="text-[11px] px-3 py-2 rounded"
-                        style={{ background: "rgba(239,68,68,0.1)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.2)" }}
+                        style={{
+                            background: "rgba(239,68,68,0.1)",
+                            color: "#ef4444",
+                            border: "1px solid rgba(239,68,68,0.2)",
+                        }}
                     >
                         {data.error}
                     </div>
                 )}
 
-                {/* Summary Cards */}
-                {data && (
+                {/* Summary Cards (hidden on error so a failed request doesn't read as $0.00) */}
+                {data && !data.error && (
                     <div style={{ display: "flex", gap: 8 }}>
                         <SummaryCard label="Total Cost" value={formatCost(data.totalCostCents)} />
                         <SummaryCard
@@ -805,9 +824,7 @@ const UsageView: React.FC<ViewComponentProps<UsageViewModel>> = ({ model }) => {
                 )}
 
                 {/* Daily cost bars */}
-                {data && data.dailyCosts.length > 1 && (
-                    <DailyBar costs={data.dailyCosts} maxCost={maxDailyCost} />
-                )}
+                {data && data.dailyCosts.length > 1 && <DailyBar costs={data.dailyCosts} maxCost={maxDailyCost} />}
 
                 {/* Model breakdown */}
                 {data && data.modelBreakdown.length > 0 && (

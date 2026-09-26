@@ -5,6 +5,7 @@ import { BlockNodeModel } from "@/app/block/blocktypes";
 import { getRepoBasePath } from "@/app/store/agents";
 import { createBlock, getApi, WOS } from "@/app/store/global";
 import type { TabModel } from "@/app/store/tab-model";
+import { shellQuote } from "@/util/shellquote";
 import * as jotai from "jotai";
 import * as React from "react";
 
@@ -40,12 +41,74 @@ const FETCH_INTERVAL = 60 * 60 * 1000; // 1 hour
 
 // --- Shell Commands (dynamic from user prefs) ---
 
-function buildGitScanCommand(scanDir: string): string {
-    return `find "${scanDir}" -maxdepth 2 -type d -name ".git" 2>/dev/null | while IFS= read -r gitdir; do repo="$(dirname "$gitdir")"; echo "---REPO:$repo"; echo "BRANCH:$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"; echo "DIRTY:$(git -C "$repo" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"; echo "MSG:$(git -C "$repo" log -1 --pretty=format:'%s' 2>/dev/null)"; echo "AGO:$(git -C "$repo" log -1 --pretty=format:'%ar' 2>/dev/null)"; echo "TS:$(git -C "$repo" log -1 --pretty=format:'%ct' 2>/dev/null)"; echo "HASH:$(git -C "$repo" log -1 --pretty=format:'%H' 2>/dev/null)"; echo "REMOTE:$(git -C "$repo" remote get-url origin 2>/dev/null)"; echo "UNPUSHED:$(git -C "$repo" log @{u}.. --oneline 2>/dev/null | wc -l | tr -d ' ')"; echo "BEHIND:$(git -C "$repo" rev-list HEAD..@{u} --count 2>/dev/null || echo 0)"; done`;
+const SCAN_DONE = "---SCAN-DONE";
+const SCAN_CONCURRENCY = 4;
+const FETCH_CONCURRENCY = 3;
+// Never prompt, and give up quickly on unreachable SSH remotes so one slow repo can't stall the rest.
+const GIT_NET_ENV = `GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o ConnectTimeout=5 -o BatchMode=yes'`;
+
+function normalizeDir(dir: string): string {
+    return dir.replace(/\/+$/, "") || "/";
 }
 
-function buildGitFetchCommand(scanDir: string): string {
-    return `find "${scanDir}" -maxdepth 2 -type d -name ".git" 2>/dev/null | while IFS= read -r gitdir; do repo="$(dirname "$gitdir")"; git -C "$repo" fetch --all --quiet 2>/dev/null; done`;
+/** Only direct children of the configured scan dir are accepted as repo paths. */
+function isDirectChild(scanDir: string, repoPath: string): boolean {
+    const base = normalizeDir(scanDir);
+    const prefix = base === "/" ? "/" : base + "/";
+    if (typeof repoPath !== "string" || !repoPath.startsWith(prefix)) return false;
+    const name = repoPath.slice(prefix.length);
+    return name.length > 0 && name !== "." && name !== ".." && !/[/\n\r]/.test(name);
+}
+
+function buildRepoListCommand(scanDir: string): string {
+    return `find ${shellQuote(normalizeDir(scanDir))} -mindepth 2 -maxdepth 2 -type d -name .git 2>/dev/null; printf '%s\\n' ${shellQuote(SCAN_DONE)}`;
+}
+
+/** Returns the repo paths, or null if the listing failed / timed out (sentinel missing). */
+function parseRepoList(scanDir: string, result: { stdout: string; code: number }): string[] | null {
+    const lines = result.stdout.split("\n").filter((l) => l.length > 0);
+    if (result.code !== 0 || lines[lines.length - 1] !== SCAN_DONE) return null;
+    return lines
+        .slice(0, -1)
+        .filter((l) => l.endsWith("/.git"))
+        .map((l) => l.slice(0, -"/.git".length))
+        .filter((p) => isDirectChild(scanDir, p));
+}
+
+// printf '%s\n' (not echo): /bin/sh's echo on macOS interprets backslash escapes, which would let a
+// commit subject like "x\n---REPO:..." inject extra lines.
+function buildRepoStatusCommand(repoPath: string): string {
+    const field = (label: string, cmd: string) => `printf '%s\\n' "${label}:$(${cmd})"`;
+    return [
+        `r=${shellQuote(repoPath)}`,
+        field("BRANCH", `git -C "$r" symbolic-ref --short HEAD 2>/dev/null || echo DETACHED`),
+        field("DIRTY", `git -C "$r" status --porcelain 2>/dev/null | wc -l | tr -d ' '`),
+        field("MSG", `git -C "$r" log -1 --pretty=format:'%s' 2>/dev/null | tr '\\r\\n' '  '`),
+        field("AGO", `git -C "$r" log -1 --pretty=format:'%ar' 2>/dev/null`),
+        field("TS", `git -C "$r" log -1 --pretty=format:'%ct' 2>/dev/null`),
+        field("HASH", `git -C "$r" log -1 --pretty=format:'%H' 2>/dev/null`),
+        field("REMOTE", `git -C "$r" remote get-url origin 2>/dev/null | head -1`),
+        field("UNPUSHED", `git -C "$r" log @{u}.. --oneline 2>/dev/null | wc -l | tr -d ' '`),
+        field("BEHIND", `git -C "$r" rev-list HEAD..@{u} --count 2>/dev/null || echo 0`),
+        `printf '%s\\n' ${shellQuote(SCAN_DONE)}`,
+    ].join("; ");
+}
+
+function buildRepoFetchCommand(repoPath: string): string {
+    return `${GIT_NET_ENV} git -C ${shellQuote(repoPath)} fetch --all --quiet 2>/dev/null`;
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let next = 0;
+    const worker = async () => {
+        while (next < items.length) {
+            const i = next++;
+            results[i] = await fn(items[i]);
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return results;
 }
 
 // --- Helpers ---
@@ -63,63 +126,56 @@ function remoteToCommitUrl(remoteUrl: string, hash: string): string | null {
 
 // --- Parsing ---
 
-function parseRepoOutput(stdout: string): RepoInfo[] {
-    const blocks = stdout.split("---REPO:").filter((b) => b.trim());
-    const repos: RepoInfo[] = [];
+/** Parse one repo's status output. Returns null if the output is incomplete (failure / timeout). */
+function parseRepoStatus(repoPath: string, result: { stdout: string; code: number }): RepoInfo | null {
+    const lines = result.stdout.split("\n");
+    const nonEmpty = lines.filter((l) => l.length > 0);
+    if (result.code !== 0 || nonEmpty[nonEmpty.length - 1] !== SCAN_DONE) return null;
+    const get = (prefix: string): string => {
+        const line = lines.find((l) => l.startsWith(prefix));
+        return line ? line.slice(prefix.length).trim() : "";
+    };
 
-    for (const block of blocks) {
-        const lines = block.split("\n");
-        const repoPath = lines[0].trim();
-        if (!repoPath) continue;
+    const branch = get("BRANCH:");
+    const isDetached = branch === "DETACHED";
+    const dirtyCount = parseInt(get("DIRTY:")) || 0;
+    const lastCommitMsg = get("MSG:");
+    const lastCommitAgo = get("AGO:");
+    const lastCommitTs = parseInt(get("TS:")) || 0;
+    const lastCommitHash = get("HASH:");
+    const remoteUrl = get("REMOTE:");
+    const unpushedCount = parseInt(get("UNPUSHED:")) || 0;
+    const behindCount = parseInt(get("BEHIND:")) || 0;
 
-        const get = (prefix: string): string => {
-            const line = lines.find((l) => l.startsWith(prefix));
-            return line ? line.slice(prefix.length).trim() : "";
-        };
+    const now = Math.floor(Date.now() / 1000);
+    const staleDays = lastCommitTs > 0 ? Math.floor((now - lastCommitTs) / 86400) : 0;
 
-        const branch = get("BRANCH:");
-        const isDetached = branch === "DETACHED";
-        const dirtyCount = parseInt(get("DIRTY:")) || 0;
-        const lastCommitMsg = get("MSG:");
-        const lastCommitAgo = get("AGO:");
-        const lastCommitTs = parseInt(get("TS:")) || 0;
-        const lastCommitHash = get("HASH:");
-        const remoteUrl = get("REMOTE:");
-        const unpushedCount = parseInt(get("UNPUSHED:")) || 0;
-        const behindCount = parseInt(get("BEHIND:")) || 0;
+    const health: HealthFlag[] = [];
+    if (dirtyCount > 0) health.push("dirty");
+    if (unpushedCount > 0) health.push("unpushed");
+    if (behindCount > 0) health.push("behind");
+    if (staleDays >= STALE_THRESHOLD_DAYS) health.push("stale");
+    if (isDetached) health.push("detached");
+    if (!isDetached && branch !== "main") health.push("not-main");
 
-        const now = Math.floor(Date.now() / 1000);
-        const staleDays = lastCommitTs > 0 ? Math.floor((now - lastCommitTs) / 86400) : 0;
+    const name = repoPath.split("/").pop() || repoPath;
 
-        const health: HealthFlag[] = [];
-        if (dirtyCount > 0) health.push("dirty");
-        if (unpushedCount > 0) health.push("unpushed");
-        if (behindCount > 0) health.push("behind");
-        if (staleDays >= STALE_THRESHOLD_DAYS) health.push("stale");
-        if (isDetached) health.push("detached");
-        if (!isDetached && branch !== "main") health.push("not-main");
-
-        const name = repoPath.split("/").pop() || repoPath;
-
-        repos.push({
-            name,
-            path: repoPath,
-            branch: isDetached ? "HEAD detached" : branch,
-            isDetached,
-            dirtyCount,
-            lastCommitMsg,
-            lastCommitAgo,
-            lastCommitTs,
-            lastCommitHash,
-            remoteUrl,
-            unpushedCount,
-            behindCount,
-            staleDays,
-            health,
-        });
-    }
-
-    return repos;
+    return {
+        name,
+        path: repoPath,
+        branch: isDetached ? "HEAD detached" : branch,
+        isDetached,
+        dirtyCount,
+        lastCommitMsg,
+        lastCommitAgo,
+        lastCommitTs,
+        lastCommitHash,
+        remoteUrl,
+        unpushedCount,
+        behindCount,
+        staleDays,
+        health,
+    };
 }
 
 // --- Sorting ---
@@ -351,10 +407,7 @@ const RepoRow = React.memo(
                     */}
 
                     {/* Actions */}
-                    <div
-                        className="flex items-center gap-1 flex-shrink-0"
-                        style={{ width: 100 }}
-                    >
+                    <div className="flex items-center gap-1 flex-shrink-0" style={{ width: 100 }}>
                         <button
                             onClick={() => onFetch(repo.path)}
                             className="px-1.5 py-0.5 text-[10px] rounded"
@@ -411,14 +464,8 @@ const RepoRow = React.memo(
                 </div>
 
                 {/* Bottom row: last commit message */}
-                <div
-                    className="flex items-center gap-1.5"
-                    style={{ width: "100%", marginTop: 1, minWidth: 0 }}
-                >
-                    <span
-                        className="text-[10px] text-muted truncate"
-                        style={{ opacity: 0.6, flex: 1, minWidth: 0 }}
-                    >
+                <div className="flex items-center gap-1.5" style={{ width: "100%", marginTop: 1, minWidth: 0 }}>
+                    <span className="text-[10px] text-muted truncate" style={{ opacity: 0.6, flex: 1, minWidth: 0 }}>
                         {repo.lastCommitMsg || "no commits"}
                     </span>
                     {(() => {
@@ -459,38 +506,90 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
     const [loading, setLoading] = React.useState(false);
     const [fetching, setFetching] = React.useState(false);
     const [lastFetchTime, setLastFetchTime] = React.useState<number | null>(null);
+    const [scanError, setScanError] = React.useState<string | null>(null);
+    const [fetchError, setFetchError] = React.useState<string | null>(null);
+    const reposRef = React.useRef<RepoInfo[]>([]);
+    const refreshPromiseRef = React.useRef<Promise<void> | null>(null);
+    const fetchInFlightRef = React.useRef(false);
     const [sortKey, setSortKey] = React.useState<SortKey>("ago");
     const [sortDir, setSortDir] = React.useState<SortDir>("desc");
 
-    const refreshRepos = React.useCallback(async () => {
+    const doRefresh = React.useCallback(async () => {
         const scanDir = getRepoBasePath();
         if (!scanDir) {
+            reposRef.current = [];
             setRepos([]);
-            setLoading(false);
+            setScanError(null);
             return;
         }
-        setLoading(true);
         try {
-            const result = await getApi().execCommand(buildGitScanCommand(scanDir));
-            const parsed = parseRepoOutput(result.stdout);
-            setRepos(parsed);
+            const listResult = await getApi().execCommand(buildRepoListCommand(scanDir));
+            const paths = parseRepoList(scanDir, listResult);
+            if (paths == null) {
+                // Keep the previous list rather than silently shrinking it.
+                setScanError("Repo scan failed or timed out; showing previous results.");
+                return;
+            }
+            const previous = new Map(reposRef.current.map((r) => [r.path, r]));
+            let failed = 0;
+            const scanned = await mapLimit(paths, SCAN_CONCURRENCY, async (repoPath) => {
+                const result = await getApi().execCommand(buildRepoStatusCommand(repoPath));
+                const info = parseRepoStatus(repoPath, result);
+                if (info) return info;
+                failed++;
+                return previous.get(repoPath) ?? null;
+            });
+            const next = scanned.filter((r): r is RepoInfo => r != null);
+            reposRef.current = next;
+            setRepos(next);
+            setScanError(failed > 0 ? `${failed} repo(s) failed to scan; showing previous data for them.` : null);
         } catch (e) {
             console.error("Failed to refresh git repos:", e);
+            setScanError("Repo scan failed; showing previous results.");
         }
-        setLoading(false);
     }, []);
+
+    // Coalesce overlapping refreshes (poll + fetch + button) into one in-flight scan.
+    const refreshRepos = React.useCallback(async () => {
+        if (refreshPromiseRef.current) return refreshPromiseRef.current;
+        setLoading(true);
+        const p = doRefresh().finally(() => {
+            refreshPromiseRef.current = null;
+            setLoading(false);
+        });
+        refreshPromiseRef.current = p;
+        return p;
+    }, [doRefresh]);
 
     const fetchAndRefresh = React.useCallback(async () => {
         const scanDir = getRepoBasePath();
-        if (!scanDir) return;
+        if (!scanDir || fetchInFlightRef.current) return;
+        fetchInFlightRef.current = true;
         setFetching(true);
         try {
-            await getApi().execCommand(buildGitFetchCommand(scanDir));
-            setLastFetchTime(Date.now());
+            const paths = parseRepoList(scanDir, await getApi().execCommand(buildRepoListCommand(scanDir)));
+            if (paths == null) {
+                setFetchError("Fetch skipped: repo scan failed or timed out.");
+            } else {
+                // One command per repo (each with its own timeout), bounded concurrency.
+                const codes = await mapLimit(paths, FETCH_CONCURRENCY, async (repoPath) => {
+                    const result = await getApi().execCommand(buildRepoFetchCommand(repoPath));
+                    return result.code;
+                });
+                const failed = codes.filter((c) => c !== 0).length;
+                if (failed === 0) {
+                    setLastFetchTime(Date.now());
+                    setFetchError(null);
+                } else {
+                    setFetchError(`Fetch failed or timed out for ${failed} of ${paths.length} repo(s).`);
+                }
+            }
         } catch (e) {
             console.error("Failed to fetch repos:", e);
+            setFetchError("Fetch failed.");
         }
         await refreshRepos();
+        fetchInFlightRef.current = false;
         setFetching(false);
     }, [refreshRepos]);
 
@@ -533,27 +632,41 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
         await createBlock(blockDef);
     }, []);
 
+    const isKnownRepo = (repoPath: string): boolean => {
+        const scanDir = getRepoBasePath();
+        return !!scanDir && isDirectChild(scanDir, repoPath);
+    };
+
     const handleOpen = React.useCallback(async (repoPath: string) => {
-        await getApi().execCommand(`open "${repoPath}"`);
+        if (!isKnownRepo(repoPath)) return;
+        await getApi().execCommand(`open ${shellQuote(repoPath)}`);
     }, []);
 
-    const handleFetch = React.useCallback(async (repoPath: string) => {
-        try {
-            await getApi().execCommand(`git -C "${repoPath}" fetch --all --quiet 2>/dev/null`);
-            await refreshRepos();
-        } catch (e) {
-            console.error("Failed to fetch:", repoPath, e);
-        }
-    }, [refreshRepos]);
+    const handleFetch = React.useCallback(
+        async (repoPath: string) => {
+            if (!isKnownRepo(repoPath)) return;
+            try {
+                await getApi().execCommand(buildRepoFetchCommand(repoPath));
+                await refreshRepos();
+            } catch (e) {
+                console.error("Failed to fetch:", repoPath, e);
+            }
+        },
+        [refreshRepos]
+    );
 
-    const handlePull = React.useCallback(async (repoPath: string) => {
-        try {
-            await getApi().execCommand(`git -C "${repoPath}" pull --quiet 2>/dev/null`);
-            await refreshRepos();
-        } catch (e) {
-            console.error("Failed to pull:", repoPath, e);
-        }
-    }, [refreshRepos]);
+    const handlePull = React.useCallback(
+        async (repoPath: string) => {
+            if (!isKnownRepo(repoPath)) return;
+            try {
+                await getApi().execCommand(`${GIT_NET_ENV} git -C ${shellQuote(repoPath)} pull --quiet 2>/dev/null`);
+                await refreshRepos();
+            } catch (e) {
+                console.error("Failed to pull:", repoPath, e);
+            }
+        },
+        [refreshRepos]
+    );
 
     // Summary stats
     const dirtyCount = repos.filter((r) => r.dirtyCount > 0).length;
@@ -564,7 +677,13 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
     return (
         <div
             className="flex flex-col overflow-hidden"
-            style={{ background: "var(--block-bg-color)", flex: "1 1 0", minWidth: 0, height: "100%", alignSelf: "stretch" }}
+            style={{
+                background: "var(--block-bg-color)",
+                flex: "1 1 0",
+                minWidth: 0,
+                height: "100%",
+                alignSelf: "stretch",
+            }}
         >
             {/* Header */}
             <div
@@ -576,6 +695,15 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
                     <span className="text-[11px] text-muted">{repos.length} tracked</span>
                 </div>
                 <div className="flex items-center gap-1.5">
+                    {(scanError || fetchError) && (
+                        <span
+                            className="text-[10px]"
+                            style={{ color: "#f97316" }}
+                            title={[scanError, fetchError].filter(Boolean).join("\n")}
+                        >
+                            <i className="fa-sharp fa-solid fa-triangle-exclamation" /> stale
+                        </span>
+                    )}
                     {lastFetchTime && (
                         <span className="text-[10px] text-muted" style={{ opacity: 0.5 }}>
                             fetched {Math.round((Date.now() - lastFetchTime) / 60000)}m ago
@@ -601,21 +729,42 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
             </div>
 
             {/* Column headers */}
-            <div
-                className="flex items-center gap-2 px-2 py-1.5 border-b border-white/5"
-                style={{ width: "100%" }}
-            >
+            <div className="flex items-center gap-2 px-2 py-1.5 border-b border-white/5" style={{ width: "100%" }}>
                 <div style={{ flex: "2.2 1 0", minWidth: 0 }}>
-                    <SortHeader label="Repo" sortKey="name" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} />
+                    <SortHeader
+                        label="Repo"
+                        sortKey="name"
+                        currentKey={sortKey}
+                        currentDir={sortDir}
+                        onSort={handleSort}
+                    />
                 </div>
                 <div style={{ flex: "1.8 1 0", minWidth: 0 }}>
-                    <SortHeader label="Branch" sortKey="branch" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} />
+                    <SortHeader
+                        label="Branch"
+                        sortKey="branch"
+                        currentKey={sortKey}
+                        currentDir={sortDir}
+                        onSort={handleSort}
+                    />
                 </div>
                 <div style={{ flex: "1.2 1 0", minWidth: 0 }}>
-                    <SortHeader label="Status" sortKey="status" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} />
+                    <SortHeader
+                        label="Status"
+                        sortKey="status"
+                        currentKey={sortKey}
+                        currentDir={sortDir}
+                        onSort={handleSort}
+                    />
                 </div>
                 <div style={{ flex: "1.2 1 0", minWidth: 0 }}>
-                    <SortHeader label="Ago" sortKey="ago" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} />
+                    <SortHeader
+                        label="Ago"
+                        sortKey="ago"
+                        currentKey={sortKey}
+                        currentDir={sortDir}
+                        onSort={handleSort}
+                    />
                 </div>
                 {/* Health header — commented out
                 <div style={{ flex: "1.5 1 0", minWidth: 0 }}>
@@ -623,7 +772,10 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
                 </div>
                 */}
                 <div style={{ width: 100 }}>
-                    <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--secondary-text-color)" }}>
+                    <span
+                        className="text-[10px] font-semibold uppercase tracking-wider"
+                        style={{ color: "var(--secondary-text-color)" }}
+                    >
                         Actions
                     </span>
                 </div>
@@ -637,7 +789,9 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
                 {repos.length === 0 && !loading && (
                     <div className="flex items-center justify-center py-8">
                         <span className="text-[12px] text-muted">
-                            {getRepoBasePath() ? "No git repos found." : "Set Repo Base Path in Settings to scan for repos."}
+                            {getRepoBasePath()
+                                ? "No git repos found."
+                                : "Set Repo Base Path in Settings to scan for repos."}
                         </span>
                     </div>
                 )}
@@ -655,10 +809,7 @@ const GitDashView: React.FC<ViewComponentProps<GitDashViewModel>> = ({ model }) 
 
             {/* Footer summary */}
             {repos.length > 0 && (
-                <div
-                    className="flex items-center gap-3 px-3 py-2 border-t border-white/10"
-                    style={{ width: "100%" }}
-                >
+                <div className="flex items-center gap-3 px-3 py-2 border-t border-white/10" style={{ width: "100%" }}>
                     {dirtyCount > 0 && (
                         <span className="text-[11px]" style={{ color: "#ef4444" }}>
                             {dirtyCount} dirty

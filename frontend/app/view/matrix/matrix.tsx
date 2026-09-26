@@ -7,7 +7,7 @@ import { WOS } from "@/store/global";
 import * as jotai from "jotai";
 import * as React from "react";
 
-import { applyGlow, BG_BLACK, clearGlow, PHOSPHOR_GREEN, PHOSPHOR_GREEN_DIM, PHOSPHOR_GREEN_MID } from "../vizutil/vizcolors";
+import { applyGlow, BG_BLACK, clearGlow, PHOSPHOR_GREEN, PHOSPHOR_GREEN_MID } from "../vizutil/vizcolors";
 import { getFleetFragments, getInboxEntries, subscribeFleet, subscribeInbox } from "../vizutil/vizdata";
 import { DrawFunction, randomRange, useAnimationLoop, useCanvasSetup } from "../vizutil/vizutil";
 
@@ -43,8 +43,20 @@ function randomChar(): string {
 // --- Data Fragment Source ---
 
 const AGENT_NAMES = [
-    "JULIAN", "HEAVY", "DECKER", "SELLIVAN", "QIN", "LEE", "MANU",
-    "ELIZA", "ADONI", "RENNER", "SAMANTHA", "SIDDIG", "KOGAN", "YADAV",
+    "JULIAN",
+    "HEAVY",
+    "DECKER",
+    "SELLIVAN",
+    "QIN",
+    "LEE",
+    "MANU",
+    "ELIZA",
+    "ADONI",
+    "RENNER",
+    "SAMANTHA",
+    "SIDDIG",
+    "KOGAN",
+    "YADAV",
 ];
 
 function getDataFragments(): string[] {
@@ -62,8 +74,8 @@ function getDataFragments(): string[] {
 
     const inbox = getInboxEntries();
     for (const e of inbox) {
-        fragments.push(e.from.toUpperCase());
-        if (e.signal) fragments.push(e.signal.toUpperCase());
+        if (typeof e?.from === "string") fragments.push(e.from.toUpperCase());
+        if (typeof e?.signal === "string" && e.signal) fragments.push(e.signal.toUpperCase());
     }
 
     return fragments;
@@ -213,9 +225,7 @@ function createDrawFn(state: MatrixState): DrawFunction {
                 } else {
                     // Tail — dim
                     const alpha = Math.max(0.1, 1 - distFromHead / col.trailLength);
-                    ctx.fillStyle = isDataCol
-                        ? `rgba(0, 255, 65, ${alpha * 0.8})`
-                        : `rgba(0, 170, 42, ${alpha * 0.5})`;
+                    ctx.fillStyle = isDataCol ? `rgba(0, 255, 65, ${alpha * 0.8})` : `rgba(0, 170, 42, ${alpha * 0.5})`;
                     clearGlow(ctx);
                 }
 
