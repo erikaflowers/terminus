@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { getGlobalConfig, setGlobalConfig } from "@/app/store/agents";
-import { getApi } from "@/app/store/global";
+import { getApi, pushCloudSyncNow } from "@/app/store/global";
 import { getAtoms } from "@/app/store/global-atoms";
 import type { WaveConfigViewModel } from "@/app/view/waveconfig/waveconfig-model";
 import { useAtom, useAtomValue } from "jotai";
@@ -160,21 +160,8 @@ const AccountSection = memo(() => {
                         setLastSynced(pullResult.updated_at);
                     } else {
                         // Cloud is empty — push local configs to seed it
-                        const configDir = getApi().getConfigDir();
-                        const syncKeys = ["settings", "connections", "widgets", "agents"];
-                        const configs: Record<string, any> = {};
-                        for (const key of syncKeys) {
-                            try {
-                                const raw = await getApi().readTextFile(configDir + "/" + key + ".json");
-                                if (raw) configs[key] = JSON.parse(raw);
-                            } catch {
-                                // skip missing files
-                            }
-                        }
-                        if (Object.keys(configs).length > 0) {
-                            const pushResult = await getApi().terminusSyncPush(configs);
-                            if (pushResult.ok) setLastSynced(pushResult.updated_at);
-                        }
+                        const pushResult = await pushCloudSyncNow();
+                        if (pushResult?.ok) setLastSynced(pushResult.updated_at);
                     }
                 }
             }
@@ -211,19 +198,8 @@ const AccountSection = memo(() => {
     const handlePush = useCallback(async () => {
         setLoading(true);
         try {
-            const configDir = getApi().getConfigDir();
-            const syncKeys = ["settings", "connections", "widgets", "agents"];
-            const configs: Record<string, any> = {};
-            for (const key of syncKeys) {
-                try {
-                    const raw = await getApi().readTextFile(configDir + "/" + key + ".json");
-                    if (raw) configs[key] = JSON.parse(raw);
-                } catch {}
-            }
-            if (Object.keys(configs).length > 0) {
-                const result = await getApi().terminusSyncPush(configs);
-                if (result.ok) setLastSynced(result.updated_at);
-            }
+            const result = await pushCloudSyncNow();
+            if (result?.ok && result.updated_at) setLastSynced(result.updated_at);
         } finally {
             setLoading(false);
         }

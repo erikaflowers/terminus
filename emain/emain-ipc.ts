@@ -8,6 +8,7 @@ import * as child_process from "node:child_process";
 import * as path from "path";
 import { PNG } from "pngjs";
 import { Readable } from "stream";
+import { pathToFileURL } from "url";
 import { RpcApi } from "../frontend/app/store/wshclientapi";
 import { getWebServerEndpoint } from "../frontend/util/endpoints";
 import * as keyutil from "../frontend/util/keyutil";
@@ -20,12 +21,20 @@ import {
     setWasActive,
 } from "./emain-activity";
 import { createBuilderWindow, getAllBuilderWindows, getBuilderWindowByWebContentsId } from "./emain-builder";
-import { callWithOriginalXdgCurrentDesktopAsync, unamePlatform } from "./emain-platform";
+import {
+    clearAuthState,
+    getDevices,
+    pullAndWriteConfigs,
+    pushSyncedConfigs,
+    readAuthState,
+    refreshTokenIfNeeded,
+    startOAuthLogin,
+    writeAuthState,
+} from "./emain-oauth";
+import { callWithOriginalXdgCurrentDesktopAsync, getElectronAppBasePath, unamePlatform } from "./emain-platform";
 import { getWaveTabViewByWebContentsId } from "./emain-tabview";
 import { handleCtrlShiftState } from "./emain-util";
 import { getWaveVersion } from "./emain-wavesrv";
-import { startOAuthLogin, readAuthState, writeAuthState, clearAuthState, pullConfigs, pushConfigs, getDevices, refreshTokenIfNeeded } from "./emain-oauth";
-import { getWaveConfigDir } from "./emain-platform";
 import { createNewWaveWindow, focusedWaveWindow, getClientId, getWaveWindowByWebContentsId } from "./emain-window";
 import { ElectronWshClient } from "./emain-wsh";
 
@@ -187,18 +196,58 @@ function saveImageFileWithNativeDialog(defaultFileName: string, mimeType: string
         });
 }
 
+// URL prefix the app's own UI is loaded from (see emain-tabview.ts / emain-builder.ts)
+function getAppUiUrlPrefix(): string {
+    const rendererUrl = process.env.ELECTRON_RENDERER_URL;
+    if (rendererUrl) {
+        try {
+            return new URL(rendererUrl).origin + "/";
+        } catch {
+            return null;
+        }
+    }
+    return pathToFileURL(path.join(getElectronAppBasePath(), "frontend") + path.sep).href;
+}
+
+function isAppUiDisplayMediaRequest(request: Electron.DisplayMediaRequestHandlerHandlerRequest): boolean {
+    const frame = request.frame;
+    if (frame == null || frame.parent != null) {
+        return false;
+    }
+    // a <webview> could itself be navigated to a file:// url; only trust the app's own windows/tab views
+    const wc = electron.webContents.fromFrame(frame);
+    if (wc == null || wc.getType() === "webview") {
+        return false;
+    }
+    const prefix = getAppUiUrlPrefix();
+    return prefix != null && typeof frame.url === "string" && frame.url.startsWith(prefix);
+}
+
 export function initIpcHandlers() {
-    // Audio visualizer: auto-grant system audio capture via desktopCapturer
-    electron.session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
-        electron.desktopCapturer.getSources({ types: ["screen"] }).then((sources) => {
-            if (sources.length > 0) {
-                callback({ video: sources[0], audio: "loopback" });
-            } else {
-                callback({});
-            }
-        }).catch(() => {
+    // Audio visualizer: auto-grant system audio capture via desktopCapturer.
+    // <webview> blocks without a web:partition share the default session, so any
+    // website loaded in a web block would hit this handler too. Only grant to the
+    // app's own top-level UI (file:// in prod, the Vite dev server in dev); deny
+    // everything else. getDisplayMedia requires a video source, so the primary
+    // screen is still passed alongside the loopback audio.
+    electron.session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+        if (!isAppUiDisplayMediaRequest(request)) {
+            console.log("denied getDisplayMedia request from", request.securityOrigin);
             callback({});
-        });
+            return;
+        }
+        electron.desktopCapturer
+            .getSources({ types: ["screen"] })
+            .then((sources) => {
+                if (sources.length > 0) {
+                    callback({ video: sources[0], audio: "loopback" });
+                } else {
+                    callback({});
+                }
+            })
+            .catch(() => {
+                callback({});
+            });
     });
 
     electron.ipcMain.on("open-external", (event, url) => {
@@ -612,16 +661,8 @@ export function initIpcHandlers() {
         try {
             auth = await refreshTokenIfNeeded(auth);
             const machineId = await getClientId();
-            const result = await pullConfigs(auth, machineId);
-            // Write pulled configs to disk so the filewatcher picks them up
-            if (result.configs) {
-                const configDir = getWaveConfigDir();
-                for (const [key, data] of Object.entries(result.configs)) {
-                    if (!data || typeof data !== "object") continue;
-                    const filePath = path.join(configDir, `${key}.json`);
-                    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-                }
-            }
+            // Manual pull: explicit user action, so cloud copies overwrite local files
+            const result = await pullAndWriteConfigs(auth, machineId, { skipNewerLocal: false });
             return { ok: true, ...result };
         } catch (e) {
             return { ok: false, error: (e as Error).message };
@@ -636,7 +677,7 @@ export function initIpcHandlers() {
         try {
             auth = await refreshTokenIfNeeded(auth);
             const machineId = await getClientId();
-            const result = await pushConfigs(auth, machineId, configs);
+            const result = await pushSyncedConfigs(auth, machineId, configs);
             return { ok: true, ...result };
         } catch (e) {
             return { ok: false, error: (e as Error).message };

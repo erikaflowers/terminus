@@ -23,11 +23,14 @@ import (
 	"github.com/wavetermdev/waveterm/pkg/wavebase"
 )
 
-const WCloudEndpoint = "https://api.waveterm.dev/central"
+// Terminus: no default cloud endpoints, so production builds never contact Wave's
+// servers (telemetry, diagnostic pings, no-telemetry updates, Wave AI cloud).
+// In dev mode the WCLOUD_* env vars below can still point these at a server.
+const WCloudEndpoint = ""
 const WCloudEndpointVarName = "WCLOUD_ENDPOINT"
-const WCloudWSEndpoint = "wss://wsapi.waveterm.dev/"
+const WCloudWSEndpoint = ""
 const WCloudWSEndpointVarName = "WCLOUD_WS_ENDPOINT"
-const WCloudPingEndpoint = "https://ping.waveterm.dev/central"
+const WCloudPingEndpoint = ""
 const WCloudPingEndpointVarName = "WCLOUD_PING_ENDPOINT"
 
 var WCloudWSEndpoint_VarCache string
@@ -238,6 +241,10 @@ func SendAllTelemetry(clientId string) error {
 		log.Printf("telemetry disabled, not sending\n")
 		return nil
 	}
+	if GetEndpoint() == "" {
+		// no telemetry endpoint configured (the default for Terminus), nothing to send
+		return nil
+	}
 	_, err := sendTEvents(clientId)
 	if err != nil {
 		return err
@@ -282,6 +289,9 @@ func sendTelemetry(clientId string) error {
 }
 
 func SendNoTelemetryUpdate(ctx context.Context, clientId string, noTelemetryVal bool) error {
+	if GetEndpoint() == "" {
+		return nil
+	}
 	req, err := makeAnonPostReq(ctx, NoTelemetryUrl, NoTelemetryInputType{ClientId: clientId, Value: noTelemetryVal})
 	if err != nil {
 		return err
