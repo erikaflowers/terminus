@@ -27,7 +27,6 @@ import {
     isWslConnName,
     NullAtom,
 } from "@/util/util";
-import { isPreviewWindow } from "./windowtype";
 import { atom, Atom, PrimitiveAtom, useAtomValue } from "jotai";
 import {
     atoms,
@@ -40,6 +39,7 @@ import {
 import { globalStore } from "./jotaiStore";
 import { modalsModel } from "./modalmodel";
 import { ClientService, ObjectService } from "./services";
+import { isPreviewWindow } from "./windowtype";
 import * as WOS from "./wos";
 import { getFileSubject, waveEventSubscribeSingle } from "./wps";
 
@@ -133,7 +133,7 @@ function debouncedCloudSyncPush() {
                 const result = await getApi().terminusSyncPush(configs);
                 if (result?.ok) {
                     lastPushedSyncContent = JSON.stringify(configs);
-                    if (!(result as any).skipped) {
+                    if (!result.skipped) {
                         console.log("cloud sync: pushed configs after change");
                     }
                 }
@@ -843,12 +843,20 @@ function recordTEvent(event: string, props?: TEventProps) {
     RpcApi.RecordTEventCommand(TabRpcClient, { event, props }, { noresponse: true });
 }
 
-export { ConnStatusMapAtom, getAtoms, initGlobalAtoms, orefAtomCache, TabIndicatorMap, blockComponentModelMap } from "./global-atoms";
+export {
+    blockComponentModelMap,
+    ConnStatusMapAtom,
+    getAtoms,
+    initGlobalAtoms,
+    orefAtomCache,
+    TabIndicatorMap,
+} from "./global-atoms";
 
 export {
     atoms,
     clearAllTabIndicators,
     clearTabIndicatorFromFocus,
+    collectSyncConfigs,
     createBlock,
     createBlockSplitHorizontally,
     createBlockSplitVertically,
@@ -856,7 +864,6 @@ export {
     fetchWaveFile,
     getAllBlockComponentModels,
     getApi,
-    collectSyncConfigs,
     getBlockComponentModel,
     getBlockMetaKeyAtom,
     getBlockTermDurableAtom,
@@ -879,6 +886,7 @@ export {
     loadConnStatus,
     loadTabIndicators,
     openLink,
+    pushCloudSyncNow,
     readAtom,
     recordTEvent,
     refocusNode,
@@ -886,7 +894,6 @@ export {
     replaceBlock,
     setActiveTab,
     setNodeFocus,
-    pushCloudSyncNow,
     setPlatform,
     setTabIndicator,
     subscribeToConnEvents,

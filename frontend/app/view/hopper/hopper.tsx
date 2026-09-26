@@ -44,6 +44,10 @@ const QUEUE_FILE = "hopper-queue.json";
 // on (the remote host in remote mode). Paths are used inside double quotes so $HOME expands.
 const INBOX_PATH = "$HOME/.claude/hooks/hopper-inbox.jsonl";
 const INBOX_KEPT_PATH = "$HOME/.claude/hooks/hopper-inbox.kept.jsonl";
+// Append-only record of everything consumed (relay signals included), trimmed to the last
+// INBOX_HISTORY_LINES lines. The visualizer panels read this, since the inbox itself is drained.
+const INBOX_HISTORY_PATH = "$HOME/.claude/hooks/hopper-inbox.history.jsonl";
+const INBOX_HISTORY_LINES = 500;
 
 function agentColor(name: string): string {
     return AGENT_COLORS[name.toLowerCase()] || FALLBACK_COLOR;
@@ -172,7 +176,9 @@ function parseInboxLines(stdout: string): InboxMessage[] {
 // fresh inbox file, so nothing written between the read and the cleanup is lost.
 async function consumeInbox(): Promise<InboxMessage[]> {
     const script =
-        `f="${INBOX_PATH}"; c="$f.consume.$$"; ` + `[ -s "$f" ] || exit 0; mv "$f" "$c" && cat "$c" && rm -f "$c"`;
+        `f="${INBOX_PATH}"; c="$f.consume.$$"; h="${INBOX_HISTORY_PATH}"; ` +
+        `[ -s "$f" ] || exit 0; mv "$f" "$c" && cat "$c" && cat "$c" >> "$h" && rm -f "$c"; ` +
+        `tail -n ${INBOX_HISTORY_LINES} "$h" > "$h.tmp.$$" && mv "$h.tmp.$$" "$h"`;
     const result = await getApi().execCommand(hostShellCommand(script));
     return parseInboxLines(result.stdout);
 }

@@ -11,7 +11,8 @@ function hooksPath(file: string): string {
     return `${getApi().getHomeDir()}/.claude/hooks/${file}`;
 }
 const fleetDb = () => hooksPath("fleet-log.db");
-const hopperInbox = () => hooksPath("hopper-inbox.jsonl");
+// The Hopper drains hopper-inbox.jsonl every few seconds; it keeps a history of everything it consumed.
+const hopperInbox = () => hooksPath("hopper-inbox.history.jsonl");
 const FLEET_POLL_MS = 30_000;
 const HOPPER_POLL_MS = 10_000;
 

@@ -36,6 +36,8 @@ const (
 	MetaKey_FrameTitle                       = "frame:title"
 	MetaKey_FrameIcon                        = "frame:icon"
 	MetaKey_FrameText                        = "frame:text"
+	MetaKey_FrameCollapsed                   = "frame:collapsed"
+	MetaKey_FramePrevSize                    = "frame:prevsize"
 
 	MetaKey_CmdClear                         = "cmd:*"
 	MetaKey_Cmd                              = "cmd"
@@ -140,6 +142,12 @@ const (
 	MetaKey_TermBellIndicator                = "term:bellindicator"
 	MetaKey_TermOsc52                        = "term:osc52"
 	MetaKey_TermDurable                      = "term:durable"
+	MetaKey_TermBgColor                      = "term:bgcolor"
+
+	MetaKey_AgentClear                       = "agent:*"
+	MetaKey_AgentName                        = "agent:name"
+	MetaKey_AgentColor                       = "agent:color"
+	MetaKey_AgentRole                        = "agent:role"
 
 	MetaKey_WebZoom                          = "web:zoom"
 	MetaKey_WebHideNav                       = "web:hidenav"

@@ -140,7 +140,13 @@ declare global {
         setIsActive: () => Promise<void>; // set-is-active
 
         // Terminus Cloud Sync
-        terminusAuthLogin: () => Promise<{ ok: boolean; email?: string; name?: string; picture?: string; error?: string }>;
+        terminusAuthLogin: () => Promise<{
+            ok: boolean;
+            email?: string;
+            name?: string;
+            picture?: string;
+            error?: string;
+        }>;
         terminusAuthLogout: () => Promise<{ ok: boolean }>;
         terminusAuthStatus: () => Promise<{
             loggedIn: boolean;
@@ -157,7 +163,9 @@ declare global {
             updated_at?: string;
             error?: string;
         }>;
-        terminusSyncPush: (configs: Record<string, any>) => Promise<{ ok: boolean; updated_at?: string; error?: string }>;
+        terminusSyncPush: (
+            configs: Record<string, any>
+        ) => Promise<{ ok: boolean; updated_at?: string; error?: string; skipped?: boolean }>;
         terminusDevices: () => Promise<{ ok: boolean; devices?: any[]; error?: string }>;
         terminusSyncToggle: (enabled: boolean) => Promise<{ ok: boolean; syncEnabled?: boolean; error?: string }>;
     };

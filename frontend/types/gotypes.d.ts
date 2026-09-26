@@ -1043,6 +1043,8 @@ declare global {
         "frame:title"?: string;
         "frame:icon"?: string;
         "frame:text"?: string;
+        "frame:collapsed"?: boolean;
+        "frame:prevsize"?: number;
         "cmd:*"?: boolean;
         cmd?: string;
         "cmd:interactive"?: boolean;
@@ -1137,6 +1139,11 @@ declare global {
         "term:bellindicator"?: boolean;
         "term:osc52"?: string;
         "term:durable"?: boolean;
+        "term:bgcolor"?: string;
+        "agent:*"?: boolean;
+        "agent:name"?: string;
+        "agent:color"?: string;
+        "agent:role"?: string;
         "web:zoom"?: number;
         "web:hidenav"?: boolean;
         "web:partition"?: string;
