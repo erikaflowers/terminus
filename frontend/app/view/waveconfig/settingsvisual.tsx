@@ -5,7 +5,7 @@ import { getGlobalConfig, setGlobalConfig } from "@/app/store/agents";
 import { getApi } from "@/app/store/global";
 import { getAtoms } from "@/app/store/global-atoms";
 import type { WaveConfigViewModel } from "@/app/view/waveconfig/waveconfig-model";
-import { useAtom, useAtomValue } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { memo, useCallback, useEffect, useState } from "react";
 
 interface SettingsSectionProps {
@@ -34,18 +34,25 @@ interface NumberSettingProps {
 }
 
 const NumberSetting = memo(({ label, description, value, onChange, min, max, suffix }: NumberSettingProps) => {
-    const handleChange = useCallback(
-        (e: React.ChangeEvent<HTMLInputElement>) => {
-            const raw = e.target.value;
-            if (raw === "") return;
-            const num = parseInt(raw, 10);
-            if (isNaN(num)) return;
-            if (min != null && num < min) return;
-            if (max != null && num > max) return;
+    const [localValue, setLocalValue] = useState(String(value));
+
+    useEffect(() => {
+        setLocalValue(String(value));
+    }, [value]);
+
+    // Commit on blur/Enter so intermediate values (e.g. "1" on the way to "12") aren't rejected
+    const handleCommit = useCallback(() => {
+        const num = parseInt(localValue.trim(), 10);
+        const invalid = isNaN(num) || (min != null && num < min) || (max != null && num > max);
+        if (invalid) {
+            setLocalValue(String(value));
+            return;
+        }
+        setLocalValue(String(num));
+        if (num !== value) {
             onChange(num);
-        },
-        [onChange, min, max]
-    );
+        }
+    }, [localValue, value, onChange, min, max]);
 
     return (
         <div className="flex items-center justify-between px-3 py-2 rounded-md hover:bg-secondary/20 transition-colors">
@@ -56,8 +63,14 @@ const NumberSetting = memo(({ label, description, value, onChange, min, max, suf
             <div className="flex items-center gap-1.5">
                 <input
                     type="number"
-                    value={value}
-                    onChange={handleChange}
+                    value={localValue}
+                    onChange={(e) => setLocalValue(e.target.value)}
+                    onBlur={handleCommit}
+                    onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                            (e.target as HTMLInputElement).blur();
+                        }
+                    }}
                     min={min}
                     max={max}
                     className="w-16 px-2 py-1 text-sm text-right bg-background border border-border rounded focus:outline-none focus:border-accent"
@@ -401,9 +414,8 @@ const SecretSetting = memo(({ label, description, value, onChange, placeholder }
         }
     }, [localValue, value, onChange]);
 
-    const maskedDisplay = localValue
-        ? localValue.slice(0, 7) + "..." + localValue.slice(-4)
-        : "";
+    // Never render any characters of the secret (screen is often streamed)
+    const maskedDisplay = localValue ? "•••••••• (set)" : "";
 
     return (
         <div className="flex flex-col gap-1.5 px-3 py-2 rounded-md hover:bg-secondary/20 transition-colors">
@@ -467,7 +479,7 @@ interface TextSettingProps {
     label: string;
     description?: string;
     value: string;
-    onChange: (value: string) => void;
+    onChange: (value: string | null) => void;
     placeholder?: string;
 }
 
@@ -514,7 +526,7 @@ interface PathSettingProps {
     label: string;
     description?: string;
     value: string;
-    onChange: (value: string) => void;
+    onChange: (value: string | null) => void;
     placeholder?: string;
 }
 
@@ -584,8 +596,9 @@ PathSetting.displayName = "PathSetting";
 const TerminusSection = memo(() => {
     const [config, setConfig] = useState(() => getGlobalConfig());
 
-    const updateField = useCallback((key: string, value: string) => {
-        const trimmed = value.trim();
+    const updateField = useCallback((key: string, value: string | null) => {
+        // Cleared fields arrive as null; store null so setGlobalConfig drops the key
+        const trimmed = (value ?? "").trim();
         const val = trimmed || null;
         setGlobalConfig({ [key]: val });
         setConfig((prev) => ({ ...prev, [key]: val }));
@@ -666,22 +679,31 @@ const SettingsVisualContent = memo(({ model }: { model: WaveConfigViewModel }) =
     const [fileContent, setFileContent] = useAtom(model.fileContentAtom);
     const liveSettings = useAtomValue(getAtoms().settingsAtom);
 
+    const setValidationError = useSetAtom(model.validationErrorAtom);
+
     const updateSetting = useCallback(
         (key: string, value: any) => {
-            const current = (() => {
-                try {
-                    return JSON.parse(fileContent || "{}");
-                } catch {
-                    return {};
-                }
-            })();
+            // Never fall back to {} here: saving would overwrite settings.json with a single key.
+            // An empty buffer means the file failed to load (a truly empty file loads as "{\n\n}").
+            let current: any;
+            try {
+                current = fileContent?.trim() ? JSON.parse(fileContent) : null;
+            } catch {
+                current = null;
+            }
+            if (current == null || typeof current !== "object" || Array.isArray(current)) {
+                const msg = "Settings not saved: settings.json is empty or invalid JSON. Fix it in the JSON tab first.";
+                console.error(msg);
+                setValidationError(msg);
+                return;
+            }
             current[key] = value;
             const updated = JSON.stringify(current, null, 2);
             setFileContent(updated);
             model.markAsEdited();
             model.saveFile();
         },
-        [fileContent, setFileContent, model]
+        [fileContent, setFileContent, setValidationError, model]
     );
 
     return (
