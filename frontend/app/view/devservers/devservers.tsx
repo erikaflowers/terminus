@@ -5,6 +5,7 @@ import { BlockNodeModel } from "@/app/block/blocktypes";
 import { getRepoBasePath } from "@/app/store/agents";
 import { getApi, WOS } from "@/app/store/global";
 import type { TabModel } from "@/app/store/tab-model";
+import { shellQuote } from "@/util/shellquote";
 import * as jotai from "jotai";
 import * as React from "react";
 
@@ -54,8 +55,9 @@ async function resolveProject(pid: number): Promise<string> {
     if (!basePath) return "(unknown)";
     try {
         const escaped = basePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const result = await getApi().execCommand(`/usr/sbin/lsof -p ${pid} -Fn 2>/dev/null | grep '^n.*${basePath}/' | head -1`);
-        const line = result.stdout.trim();
+        // Filter in JS rather than interpolating basePath into a grep pattern / shell string.
+        const result = await getApi().execCommand(`/usr/sbin/lsof -p ${shellQuote(String(pid))} -Fn 2>/dev/null`);
+        const line = result.stdout.split("\n").find((l) => l.startsWith("n") && l.includes(basePath + "/"));
         if (!line) return "(unknown)";
         const regex = new RegExp(escaped + "/([^/]+(?:/[^/]+)?)");
         const match = line.match(regex);
@@ -66,6 +68,57 @@ async function resolveProject(pid: number): Promise<string> {
     } catch {
         return "(unknown)";
     }
+}
+
+const LSOF_DONE = "__TERMINUS_LSOF_DONE__";
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Base name of an executable path, as lsof would show it (lsof truncates COMMAND, so compare by prefix). */
+function commMatches(psComm: string, lsofCmd: string): boolean {
+    const base = psComm.trim().split("/").pop() ?? "";
+    if (!base || !lsofCmd) return false;
+    return base.startsWith(lsofCmd) || lsofCmd.startsWith(base);
+}
+
+/** Re-check that `server.pid` still listens on `server.port` and is still the same command. */
+async function verifyServer(server: DevServer): Promise<boolean> {
+    const pid = shellQuote(String(server.pid));
+    const listen = await getApi().execCommand(
+        `/usr/sbin/lsof -a -p ${pid} -iTCP:${shellQuote(String(server.port))} -sTCP:LISTEN -t 2>/dev/null`
+    );
+    if (listen.code !== 0 || !listen.stdout.split("\n").some((l) => l.trim() === String(server.pid))) {
+        return false;
+    }
+    const ps = await getApi().execCommand(`/bin/ps -o comm= -p ${pid}`);
+    if (ps.code !== 0) return false;
+    return commMatches(ps.stdout, server.process);
+}
+
+async function isAlive(pid: number): Promise<boolean> {
+    const result = await getApi().execCommand(`kill -0 ${shellQuote(String(pid))} 2>/dev/null`);
+    return result.code === 0;
+}
+
+/** Kill exactly the displayed PID: verify it, SIGTERM, wait briefly, SIGKILL only if still alive. */
+async function killServer(server: DevServer): Promise<boolean> {
+    if (!Number.isInteger(server.pid) || server.pid <= 1) return false;
+    if (!(await verifyServer(server))) {
+        console.warn(
+            `devservers: pid ${server.pid} no longer listens on :${server.port} as ${server.process}; not killing`
+        );
+        return false;
+    }
+    const pid = shellQuote(String(server.pid));
+    await getApi().execCommand(`kill -TERM ${pid} 2>/dev/null`);
+    for (let i = 0; i < 10; i++) {
+        await sleep(300);
+        if (!(await isAlive(server.pid))) return true;
+    }
+    await getApi().execCommand(`kill -KILL ${pid} 2>/dev/null`);
+    return true;
 }
 
 function portColor(port: number): string {
@@ -113,7 +166,7 @@ const ServerCard = React.memo(
         onOpen,
     }: {
         server: DevServer;
-        onKill: (port: number) => void;
+        onKill: (server: DevServer) => void;
         onOpen: (port: number) => void;
     }) => {
         const color = portColor(server.port);
@@ -137,7 +190,10 @@ const ServerCard = React.memo(
                 </div>
                 <div className="flex-1 min-w-0 overflow-hidden">
                     <div className="flex items-center gap-2">
-                        <span className="text-[13px] font-semibold truncate" style={{ color: "var(--main-text-color)" }}>
+                        <span
+                            className="text-[13px] font-semibold truncate"
+                            style={{ color: "var(--main-text-color)" }}
+                        >
                             {server.project}
                         </span>
                     </div>
@@ -171,7 +227,7 @@ const ServerCard = React.memo(
                         Open
                     </button>
                     <button
-                        onClick={() => onKill(server.port)}
+                        onClick={() => onKill(server)}
                         className="px-2 py-1 text-[11px] rounded"
                         style={{
                             background: "rgba(255,0,0,0.1)",
@@ -192,12 +248,25 @@ ServerCard.displayName = "ServerCard";
 const DevServersView: React.FC<ViewComponentProps<DevServersViewModel>> = ({ model }) => {
     const [servers, setServers] = React.useState<DevServer[]>([]);
     const [loading, setLoading] = React.useState(false);
+    const inFlightRef = React.useRef(false);
+    const mountedRef = React.useRef(true);
+    const timersRef = React.useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
     const refreshServers = React.useCallback(async () => {
+        if (inFlightRef.current) return;
+        inFlightRef.current = true;
         setLoading(true);
         try {
-            const result = await getApi().execCommand("/usr/sbin/lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null");
-            const parsed = parseLsofOutput(result.stdout);
+            // lsof exits 1 when nothing is listening, so use a sentinel to tell "no servers" apart from
+            // a failure/timeout. On failure keep the previous list instead of showing "all servers gone".
+            const result = await getApi().execCommand(
+                `/usr/sbin/lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null; echo ${LSOF_DONE}`
+            );
+            if (result.code !== 0 || !result.stdout.includes(LSOF_DONE)) {
+                console.warn("devservers: lsof failed or timed out; keeping previous list");
+                return;
+            }
+            const parsed = parseLsofOutput(result.stdout.replace(LSOF_DONE, ""));
 
             // Resolve project names in parallel
             const withProjects = await Promise.all(
@@ -207,35 +276,59 @@ const DevServersView: React.FC<ViewComponentProps<DevServersViewModel>> = ({ mod
                 })
             );
 
-            setServers(withProjects);
+            if (mountedRef.current) setServers(withProjects);
         } catch (e) {
             console.error("Failed to refresh dev servers:", e);
+        } finally {
+            inFlightRef.current = false;
+            if (mountedRef.current) setLoading(false);
         }
-        setLoading(false);
     }, []);
 
-    // Initial load + polling every 30s
-    React.useEffect(() => {
-        refreshServers();
-        const interval = setInterval(refreshServers, 30000);
-        return () => clearInterval(interval);
-    }, [refreshServers]);
-
-    const handleKill = React.useCallback(
-        async (port: number) => {
-            await getApi().execCommand(`/usr/sbin/lsof -ti TCP:${port} -sTCP:LISTEN 2>/dev/null | xargs kill -9`);
-            // Brief delay for process cleanup, then refresh
-            setTimeout(() => refreshServers(), 500);
+    const scheduleRefresh = React.useCallback(
+        (ms: number) => {
+            const t = setTimeout(() => {
+                timersRef.current.delete(t);
+                refreshServers();
+            }, ms);
+            timersRef.current.add(t);
         },
         [refreshServers]
     );
 
+    // Initial load + polling every 30s
+    React.useEffect(() => {
+        mountedRef.current = true;
+        refreshServers();
+        const interval = setInterval(refreshServers, 30000);
+        const timers = timersRef.current;
+        return () => {
+            mountedRef.current = false;
+            clearInterval(interval);
+            timers.forEach((t) => clearTimeout(t));
+            timers.clear();
+        };
+    }, [refreshServers]);
+
+    const handleKill = React.useCallback(
+        async (server: DevServer) => {
+            await killServer(server);
+            // Brief delay for process cleanup, then refresh
+            scheduleRefresh(500);
+        },
+        [scheduleRefresh]
+    );
+
     const handleKillAll = React.useCallback(async () => {
-        for (const server of servers) {
-            await getApi().execCommand(`/usr/sbin/lsof -ti TCP:${server.port} -sTCP:LISTEN 2>/dev/null | xargs kill -9`);
+        const targets = [...servers];
+        if (targets.length === 0) return;
+        const list = targets.map((s) => `  :${s.port}  ${s.process} (pid ${s.pid})  ${s.project}`).join("\n");
+        if (!confirm(`Kill ${targets.length} dev server(s)?\n\n${list}`)) return;
+        for (const server of targets) {
+            await killServer(server);
         }
-        setTimeout(() => refreshServers(), 500);
-    }, [servers, refreshServers]);
+        scheduleRefresh(500);
+    }, [servers, scheduleRefresh]);
 
     const handleOpen = React.useCallback((port: number) => {
         getApi().openExternal(`http://localhost:${port}`);
@@ -252,9 +345,7 @@ const DevServersView: React.FC<ViewComponentProps<DevServersViewModel>> = ({ mod
             >
                 <div className="flex items-center gap-2">
                     <span className="text-[12px] font-semibold text-muted uppercase tracking-wider">Servers</span>
-                    <span className="text-[11px] text-muted">
-                        {servers.length} running
-                    </span>
+                    <span className="text-[11px] text-muted">{servers.length} running</span>
                 </div>
                 <button
                     onClick={refreshServers}

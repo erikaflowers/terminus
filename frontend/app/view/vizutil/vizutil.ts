@@ -3,7 +3,7 @@
 
 // Shared animation and canvas utilities for visualizer panels
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 // --- Ring Buffer ---
 
@@ -120,6 +120,7 @@ export function useAnimationLoop(
     const startTimeRef = useRef<number>(0);
     const lastFrameRef = useRef<number>(0);
     const frameIdRef = useRef<number>(0);
+    const lastWarnRef = useRef<number>(0);
 
     useEffect(() => {
         if (width === 0 || height === 0) return;
@@ -130,20 +131,30 @@ export function useAnimationLoop(
         if (!ctx) return;
 
         const minFrameInterval = 1000 / 30; // cap at 30fps
-        startTimeRef.current = performance.now();
-        lastFrameRef.current = startTimeRef.current;
+        // Start the clock once: panels keep `elapsed` timestamps in their state, so resetting it on
+        // every resize would make `elapsed - lastX` negative and stall their periodic refreshes.
+        if (startTimeRef.current === 0) startTimeRef.current = performance.now();
+        lastFrameRef.current = performance.now();
 
         const tick = (now: number) => {
+            // Schedule the next frame first so an exception in a draw can't end the loop forever.
+            frameIdRef.current = requestAnimationFrame(tick);
             const delta = now - lastFrameRef.current;
             if (delta >= minFrameInterval && !document.hidden) {
-                const elapsed = now - startTimeRef.current;
-                // Reset transform for DPR scaling
-                const dpr = window.devicePixelRatio || 1;
-                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                drawRef.current(ctx, width, height, elapsed, delta);
                 lastFrameRef.current = now;
+                const elapsed = now - startTimeRef.current;
+                try {
+                    // Reset transform for DPR scaling
+                    const dpr = window.devicePixelRatio || 1;
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    drawRef.current(ctx, width, height, elapsed, delta);
+                } catch (e) {
+                    if (now - lastWarnRef.current > 5000) {
+                        lastWarnRef.current = now;
+                        console.warn("useAnimationLoop: draw failed", e);
+                    }
+                }
             }
-            frameIdRef.current = requestAnimationFrame(tick);
         };
 
         frameIdRef.current = requestAnimationFrame(tick);

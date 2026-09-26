@@ -2,16 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { BlockNodeModel } from "@/app/block/blocktypes";
-import type { TabModel } from "@/app/store/tab-model";
 import { AgentColorTable, getRemoteConfig, getTmuxCmd } from "@/app/store/agents";
 import { getApi } from "@/app/store/global";
+import type { TabModel } from "@/app/store/tab-model";
 import { WOS } from "@/store/global";
 import * as jotai from "jotai";
 import * as React from "react";
 
 import { applyGlow, BG_BLACK, clearGlow } from "../vizutil/vizcolors";
-import { getFleetFragments, getInboxEntries, subscribeFleet, subscribeInbox } from "../vizutil/vizdata";
-import { DrawFunction, clamp, lerp, randomRange, useAnimationLoop, useCanvasSetup } from "../vizutil/vizutil";
+import {
+    getFleetFragments,
+    getInboxEntries,
+    subscribeFleet,
+    subscribeInbox,
+    type InboxEntry,
+} from "../vizutil/vizdata";
+import { clamp, DrawFunction, lerp, randomRange, useAnimationLoop, useCanvasSetup } from "../vizutil/vizutil";
 
 // --- Types ---
 
@@ -48,7 +54,7 @@ interface EdgeParticle {
 const REPULSION = 1200;
 const SPRING_K = 0.006;
 const CENTER_GRAVITY = 0.005;
-const DAMPING = 0.90;
+const DAMPING = 0.9;
 const REST_LENGTH = 150;
 
 class GraphState {
@@ -56,7 +62,7 @@ class GraphState {
     edges: GraphEdge[] = [];
     particles: EdgeParticle[] = [];
     lastTmuxPoll: number = 0;
-    lastInboxLen: number = 0;
+    lastInboxKey: string | null = null;
     initialized: boolean = false;
 
     init(width: number, height: number): void {
@@ -128,27 +134,46 @@ class GraphState {
         }
 
         // Check for new relay messages → spawn particles
+        // The inbox is a sliding window (tail -50), so its length stops growing; track the last entry
+        // we've seen (by ts + sender/recipient/signal) and treat everything after it as new.
         const inbox = getInboxEntries();
-        if (inbox.length > this.lastInboxLen) {
-            const newEntries = inbox.slice(this.lastInboxLen);
-            for (const entry of newEntries) {
-                const fromKey = entry.from.toLowerCase();
-                const toKey = (entry.to || "samantha").toLowerCase();
-                if (this.nodes.has(fromKey) && this.nodes.has(toKey)) {
-                    const fromNode = this.nodes.get(fromKey);
-                    this.particles.push({
-                        from: fromKey,
-                        to: toKey,
-                        t: 0,
-                        speed: randomRange(0.008, 0.02),
-                        color: fromNode.color,
-                    });
-                    // Boost activity on sender
-                    fromNode.activity = Math.min(1, fromNode.activity + 0.5);
+        const entryKey = (e: InboxEntry) => `${e.ts}|${e.from}|${e.to ?? ""}|${e.signal ?? ""}`;
+        if (inbox.length > 0) {
+            const lastKey = entryKey(inbox[inbox.length - 1]);
+            if (lastKey !== this.lastInboxKey) {
+                let start = 0;
+                if (this.lastInboxKey != null) {
+                    for (let i = inbox.length - 1; i >= 0; i--) {
+                        if (entryKey(inbox[i]) === this.lastInboxKey) {
+                            start = i + 1;
+                            break;
+                        }
+                    }
                 }
+                this.spawnInboxParticles(inbox.slice(start));
+                this.lastInboxKey = lastKey;
             }
         }
-        this.lastInboxLen = inbox.length;
+    }
+
+    spawnInboxParticles(newEntries: InboxEntry[]): void {
+        for (const entry of newEntries) {
+            if (typeof entry?.from !== "string") continue;
+            const fromKey = entry.from.toLowerCase();
+            const toKey = (typeof entry.to === "string" && entry.to ? entry.to : "samantha").toLowerCase();
+            if (this.nodes.has(fromKey) && this.nodes.has(toKey)) {
+                const fromNode = this.nodes.get(fromKey);
+                this.particles.push({
+                    from: fromKey,
+                    to: toKey,
+                    t: 0,
+                    speed: randomRange(0.008, 0.02),
+                    color: fromNode.color,
+                });
+                // Boost activity on sender
+                fromNode.activity = Math.min(1, fromNode.activity + 0.5);
+            }
+        }
     }
 
     stepPhysics(width: number, height: number, delta: number): void {
@@ -220,10 +245,22 @@ class GraphState {
 
             // Soft clamp — bounce gently off walls
             const pad = 40;
-            if (node.x < pad) { node.x = pad; node.vx *= -0.3; }
-            if (node.x > width - pad) { node.x = width - pad; node.vx *= -0.3; }
-            if (node.y < pad) { node.y = pad; node.vy *= -0.3; }
-            if (node.y > height - pad) { node.y = height - pad; node.vy *= -0.3; }
+            if (node.x < pad) {
+                node.x = pad;
+                node.vx *= -0.3;
+            }
+            if (node.x > width - pad) {
+                node.x = width - pad;
+                node.vx *= -0.3;
+            }
+            if (node.y < pad) {
+                node.y = pad;
+                node.vy *= -0.3;
+            }
+            if (node.y > height - pad) {
+                node.y = height - pad;
+                node.vy *= -0.3;
+            }
         }
 
         // Advance particles
@@ -238,7 +275,16 @@ class GraphState {
 
 function createDrawFn(state: GraphState): DrawFunction {
     // Persistent ambient particles for visual noise
-    let ambientParticles: { x: number; y: number; vx: number; vy: number; life: number; maxLife: number; size: number; color: string }[] = [];
+    let ambientParticles: {
+        x: number;
+        y: number;
+        vx: number;
+        vy: number;
+        life: number;
+        maxLife: number;
+        size: number;
+        color: string;
+    }[] = [];
     let lastAmbientSpawn = 0;
 
     return (ctx, width, height, elapsed, delta) => {
@@ -336,7 +382,7 @@ function createDrawFn(state: GraphState): DrawFunction {
             // Animated flow dots along the bond — bright and visible
             const dotCount = isSamanthaEdge ? 3 : 2;
             for (let d = 0; d < dotCount; d++) {
-                const t = ((elapsed / 2500 + d / dotCount + edge.from.charCodeAt(0) * 0.01) % 1);
+                const t = (elapsed / 2500 + d / dotCount + edge.from.charCodeAt(0) * 0.01) % 1;
                 const dx = lerp(a.x, b.x, t);
                 const dy = lerp(a.y, b.y, t);
                 applyGlow(ctx, a.color, 6);
@@ -499,7 +545,11 @@ function createDrawFn(state: GraphState): DrawFunction {
         // HUD overlay text
         ctx.font = "8px 'JetBrains Mono', monospace";
         ctx.fillStyle = "#2a2a2a";
-        ctx.fillText(`CREW TOPOLOGY  //  ${state.nodes.size} AGENTS  ${state.edges.length} LINKS  ${state.particles.length} ACTIVE`, 8, 14);
+        ctx.fillText(
+            `CREW TOPOLOGY  //  ${state.nodes.size} AGENTS  ${state.edges.length} LINKS  ${state.particles.length} ACTIVE`,
+            8,
+            14
+        );
         const activeCount = Array.from(state.nodes.values()).filter((n) => n.isActive).length;
         ctx.fillText(`ONLINE: ${activeCount}/${state.nodes.size}  UPTIME: ${Math.floor(elapsed / 1000)}s`, 8, 24);
         ctx.fillStyle = "#1a1a1a";
@@ -568,7 +618,11 @@ const NodeGraphView: React.FC<ViewComponentProps<NodeGraphViewModel>> = React.me
                     : `${tmux} list-sessions -F '#{session_name}' 2>/dev/null`;
                 const result = await getApi().execCommand(cmd);
                 const sessions = new Set(
-                    (result.stdout || "").trim().split("\n").filter(Boolean).map((s) => s.toLowerCase())
+                    (result.stdout || "")
+                        .trim()
+                        .split("\n")
+                        .filter(Boolean)
+                        .map((s) => s.toLowerCase())
                 );
                 for (const [name, node] of stateRef.current.nodes) {
                     node.isActive = sessions.has(name);
