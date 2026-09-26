@@ -41,7 +41,7 @@ import * as jotai from "jotai";
 import * as React from "react";
 import { getBlockingCommand } from "./shellblocking";
 import { computeTheme, DefaultTermTheme } from "./termutil";
-import { TermWrap } from "./termwrap";
+import { MouseReportRegex, TermWrap } from "./termwrap";
 
 export class TermViewModel implements ViewModel {
     viewType: string;
@@ -83,6 +83,9 @@ export class TermViewModel implements ViewModel {
     termCursorBlinkUnsubFn: () => void;
     isCmdController: jotai.Atom<boolean>;
     isRestarting: jotai.PrimitiveAtom<boolean>;
+    // stale input mode handling (see TermWrap.resetStaleInputModes)
+    pendingModeReset: boolean = false;
+    pendingReplayCheck: boolean = false;
     termDurableStatus: jotai.Atom<BlockJobStatusData | null>;
     termConfigedDurable: jotai.Atom<null | boolean>;
     searchAtoms?: SearchAtoms;
@@ -483,6 +486,10 @@ export class TermViewModel implements ViewModel {
     }
 
     multiInputHandler(data: string) {
+        if (MouseReportRegex.test(data)) {
+            // mouse reports describe this pane's screen; other terminals never asked for them
+            return;
+        }
         const tvms = getAllBasicTermModels();
         for (const tvm of tvms) {
             if (tvm != this) {
@@ -492,6 +499,11 @@ export class TermViewModel implements ViewModel {
     }
 
     sendDataToController(data: string) {
+        if (MouseReportRegex.test(data) && globalStore.get(this.shellProcStatus) != "running") {
+            // no live process can have asked for mouse reports; don't type them into the shell
+            this.resetStaleInputModes("mouse report with no running process");
+            return;
+        }
         const b64data = stringToBase64(data);
         RpcApi.ControllerInputCommand(TabRpcClient, { blockid: this.blockId, inputdata64: b64data });
     }
@@ -531,6 +543,56 @@ export class TermViewModel implements ViewModel {
         const curStatus = globalStore.get(this.shellProcFullStatus);
         if (curStatus == null || curStatus.version < fullStatus.version) {
             globalStore.set(this.shellProcFullStatus, fullStatus);
+            this.checkStaleInputModes(curStatus, fullStatus);
+        }
+    }
+
+    // A process starting or stopping means any mouse/focus/cursor modes on screen belong to a
+    // program that is gone (tmux over a dropped connection, a restarted controller, …). Every
+    // restart path in the backend passes through "done", so transitions catch all of them.
+    checkStaleInputModes(prev: BlockControllerRuntimeStatus, next: BlockControllerRuntimeStatus) {
+        const isRunning = next.shellprocstatus == "running";
+        if (prev == null) {
+            // first status we've seen: the process may be alive (tab switch, durable session), so
+            // leave its modes alone, unless the replayed history is from a process that isn't running
+            if (this.pendingReplayCheck) {
+                this.pendingReplayCheck = false;
+                if (!isRunning) {
+                    this.resetStaleInputModes("replayed history, process " + next.shellprocstatus);
+                }
+            }
+            return;
+        }
+        const wasRunning = prev.shellprocstatus == "running";
+        if (wasRunning != isRunning) {
+            this.resetStaleInputModes(`shellproc ${prev.shellprocstatus} -> ${next.shellprocstatus}`);
+        }
+    }
+
+    resetStaleInputModes(reason: string) {
+        const termWrap = this.termRef.current;
+        if (termWrap == null || !termWrap.loaded) {
+            this.pendingModeReset = true;
+            return;
+        }
+        termWrap.resetStaleInputModes(reason);
+    }
+
+    // Called once the terminal has replayed its saved output. Replaying can switch mouse
+    // reporting back on (the "off" was never written), so reset unless a live process owns it.
+    onTermInitialLoad() {
+        const fullStatus = globalStore.get(this.shellProcFullStatus);
+        if (this.pendingModeReset) {
+            this.pendingModeReset = false;
+            this.termRef.current?.resetStaleInputModes("pending reset after load");
+            return;
+        }
+        if (fullStatus == null) {
+            this.pendingReplayCheck = true;
+            return;
+        }
+        if (fullStatus.shellprocstatus != "running") {
+            this.termRef.current?.resetStaleInputModes("replayed history, process " + fullStatus.shellprocstatus);
         }
     }
 

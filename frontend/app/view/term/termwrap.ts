@@ -46,6 +46,18 @@ export const SupportsImageInput = true;
 const IMEDedupWindowMs = 20;
 const MaxRepaintTransactionMs = 2000;
 
+// Modes a program (tmux, vim, ssh'd TUIs…) switches on and is expected to switch off itself.
+// If that program dies mid-session (connection lost, controller restart) the "off" never
+// arrives, so xterm keeps reporting scrolls/mouse moves as escape sequences, which then get
+// typed into the next shell as garbage. Order: mouse tracking (1000/1002/1003), mouse
+// encodings (1005/1006/1015), focus events (1004), application cursor keys (1), keypad (>),
+// show cursor (25).
+const StaleModeResetSeq =
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?1l\x1b>\x1b[?25h";
+
+// One or more xterm mouse reports: SGR (ESC[<b;x;yM/m), X10/normal (ESC[M + 3 bytes), urxvt (ESC[b;x;yM).
+export const MouseReportRegex = /^(?:\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\s\S]{3}|\x1b\[\d+;\d+;\d+M)+$/;
+
 // detect webgl support
 function detectWebGLSupport(): boolean {
     try {
@@ -525,6 +537,24 @@ export class TermWrap {
         if (mainFile != null) {
             await this.doTerminalWrite(mainData, null);
         }
+    }
+
+    // Turns off input modes left behind by a program that is no longer running (see StaleModeResetSeq).
+    // Writes locally to xterm only; nothing is sent to the pty and ptyOffset is untouched.
+    resetStaleInputModes(reason: string) {
+        const modes = this.terminal.modes;
+        const inAltBuffer = this.terminal.buffer.active.type === "alternate";
+        if (
+            modes.mouseTrackingMode === "none" &&
+            !modes.sendFocusMode &&
+            !modes.applicationCursorKeysMode &&
+            !modes.applicationKeypadMode &&
+            !inAltBuffer
+        ) {
+            return;
+        }
+        dlog("reset stale input modes", this.blockId, reason, modes.mouseTrackingMode, inAltBuffer);
+        this.terminal.write((inAltBuffer ? "\x1b[?1049l" : "") + StaleModeResetSeq);
     }
 
     async resyncController(reason: string) {
