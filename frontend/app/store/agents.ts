@@ -4,6 +4,7 @@
 import { atoms, getApi, WOS } from "@/app/store/global";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
+import { isSafeSessionName, shellJoin, sshCommand } from "@/util/shellquote";
 import { atom, type PrimitiveAtom } from "jotai";
 import { globalStore } from "./jotaiStore";
 
@@ -67,8 +68,16 @@ const AgentColorTable: Record<string, { color: string; role: string }> = {
 // Crew themes defined in ~/.config/terminus-dev/termthemes.json
 // Convention: "crew-{lowercase_name}"
 const CREW_THEME_AGENTS = new Set([
-    "julian", "heavy", "decker", "sellivan", "qin",
-    "lee", "manu", "eliza", "siddig", "samantha",
+    "julian",
+    "heavy",
+    "decker",
+    "sellivan",
+    "qin",
+    "lee",
+    "manu",
+    "eliza",
+    "siddig",
+    "samantha",
 ]);
 
 function getDefaultTheme(name: string): string {
@@ -110,19 +119,22 @@ async function loadAvatarDataUrl(filePath: string): Promise<string | null> {
     if (avatarLoadingPromises.has(filePath)) {
         return avatarLoadingPromises.get(filePath);
     }
-    const promise = getApi().readFileBase64(filePath).then((dataUrl) => {
-        if (!dataUrl) {
-            console.warn(`[avatars] readFileBase64 returned null for: ${filePath}`);
-        }
-        avatarCache.set(filePath, dataUrl);
-        avatarLoadingPromises.delete(filePath);
-        return dataUrl;
-    }).catch((e) => {
-        console.warn(`[avatars] failed to load: ${filePath}`, e);
-        avatarCache.set(filePath, null);
-        avatarLoadingPromises.delete(filePath);
-        return null;
-    });
+    const promise = getApi()
+        .readFileBase64(filePath)
+        .then((dataUrl) => {
+            if (!dataUrl) {
+                console.warn(`[avatars] readFileBase64 returned null for: ${filePath}`);
+            }
+            avatarCache.set(filePath, dataUrl);
+            avatarLoadingPromises.delete(filePath);
+            return dataUrl;
+        })
+        .catch((e) => {
+            console.warn(`[avatars] failed to load: ${filePath}`, e);
+            avatarCache.set(filePath, null);
+            avatarLoadingPromises.delete(filePath);
+            return null;
+        });
     avatarLoadingPromises.set(filePath, promise);
     return promise;
 }
@@ -149,50 +161,119 @@ type AgentPrefs = Record<string, string | null>;
 const agentPrefsMap = new Map<string, AgentPrefs>();
 let prefsLoaded = false;
 
+const GlobalConfigKeys: (keyof GlobalConfig)[] = [
+    "remoteHost",
+    "remoteTmuxPath",
+    "repoBasePath",
+    "agentsPath",
+    "githubOrg",
+    "plausibleApiKey",
+    "plausibleSiteId",
+    "cloudSyncUrl",
+    "cloudDevicesUrl",
+    "cloudOAuthClientId",
+    "cloudOAuthClientSecret",
+];
+
 function getPrefsFilePath(): string {
     return getApi().getConfigDir() + "/agent-preferences.json";
 }
 
-async function loadAgentPreferences(): Promise<void> {
-    if (prefsLoaded) return;
+// Reads agent-preferences.json from disk. Returns null if the file exists but can't be parsed,
+// so callers never overwrite a file they couldn't read. A missing/empty file reads as {}.
+async function readPrefsFile(): Promise<Record<string, AgentPrefs> | null> {
+    let content: string | null = null;
     try {
-        const content = await getApi().readTextFile(getPrefsFilePath());
-        if (content) {
-            const parsed = JSON.parse(content) as Record<string, AgentPrefs>;
-            for (const [key, prefs] of Object.entries(parsed)) {
-                agentPrefsMap.set(key, prefs);
-            }
-        }
+        content = await getApi().readTextFile(getPrefsFilePath());
     } catch {
-        // File doesn't exist yet or parse error — start with empty prefs
+        // treat as missing
+    }
+    if (!content || !content.trim()) {
+        return {};
+    }
+    try {
+        const parsed = JSON.parse(content);
+        if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+            console.error("[agent-prefs] agent-preferences.json is not a JSON object; not touching it");
+            return null;
+        }
+        return parsed as Record<string, AgentPrefs>;
+    } catch (e) {
+        console.error("[agent-prefs] failed to parse agent-preferences.json; not touching it", e);
+        return null;
+    }
+}
+
+function globalConfigFromPrefs(globalPrefs: AgentPrefs): GlobalConfig {
+    const config = {} as GlobalConfig;
+    for (const key of GlobalConfigKeys) {
+        config[key] = globalPrefs[key] ?? null;
+    }
+    return config;
+}
+
+let prefsLoadPromise: Promise<void> | null = null;
+
+function loadAgentPreferences(): Promise<void> {
+    if (prefsLoadPromise == null) {
+        prefsLoadPromise = doLoadAgentPreferences();
+    }
+    return prefsLoadPromise;
+}
+
+async function doLoadAgentPreferences(): Promise<void> {
+    if (prefsLoaded) return;
+    const parsed = await readPrefsFile();
+    if (parsed) {
+        for (const [key, prefs] of Object.entries(parsed)) {
+            agentPrefsMap.set(key, prefs);
+        }
     }
     // Populate global config from _global key
-    const globalPrefs = agentPrefsMap.get("_global") ?? {};
-    globalStore.set(globalConfigAtom, {
-        remoteHost: globalPrefs["remoteHost"] ?? null,
-        remoteTmuxPath: globalPrefs["remoteTmuxPath"] ?? null,
-        repoBasePath: globalPrefs["repoBasePath"] ?? null,
-        agentsPath: globalPrefs["agentsPath"] ?? null,
-        githubOrg: globalPrefs["githubOrg"] ?? null,
-        plausibleApiKey: globalPrefs["plausibleApiKey"] ?? null,
-        plausibleSiteId: globalPrefs["plausibleSiteId"] ?? null,
-        cloudSyncUrl: globalPrefs["cloudSyncUrl"] ?? null,
-        cloudDevicesUrl: globalPrefs["cloudDevicesUrl"] ?? null,
-        cloudOAuthClientId: globalPrefs["cloudOAuthClientId"] ?? null,
-        cloudOAuthClientSecret: globalPrefs["cloudOAuthClientSecret"] ?? null,
-    });
+    globalStore.set(globalConfigAtom, globalConfigFromPrefs(agentPrefsMap.get("_global") ?? {}));
     prefsLoaded = true;
 }
 
-async function saveAgentPreferences(): Promise<void> {
-    const obj: Record<string, AgentPrefs> = {};
-    for (const [key, prefs] of agentPrefsMap.entries()) {
-        if (Object.keys(prefs).length > 0) {
-            obj[key] = prefs;
+// Serializes prefs writes within this renderer. Each tab is its own renderer, so every write
+// re-reads the file and merges only its own change (read-merge-write) instead of rewriting the
+// whole file from this tab's possibly stale copy.
+let prefsWriteChain: Promise<void> = Promise.resolve();
+
+function updatePrefsFile(mutate: (prefs: Record<string, AgentPrefs>) => void): Promise<void> {
+    const run = async () => {
+        // let the initial load land first so it can't overwrite what we merge here
+        await loadAgentPreferences();
+        const fresh = await readPrefsFile();
+        if (fresh == null) {
+            // on-disk file is corrupt: keep the change in memory only, never clobber the file
+            const snapshot = Object.fromEntries(agentPrefsMap.entries());
+            mutate(snapshot);
+            for (const [key, prefs] of Object.entries(snapshot)) {
+                agentPrefsMap.set(key, prefs);
+            }
+            return;
         }
-    }
-    const json = JSON.stringify(obj, null, 2);
-    await getApi().writeTextFile(getPrefsFilePath(), json);
+        mutate(fresh);
+        const obj: Record<string, AgentPrefs> = {};
+        for (const [key, prefs] of Object.entries(fresh)) {
+            if (prefs && Object.keys(prefs).length > 0) {
+                obj[key] = prefs;
+            }
+        }
+        const json = JSON.stringify(obj, null, 2);
+        const ok = await getApi().writeTextFile(getPrefsFilePath(), json);
+        if (!ok) {
+            console.error("[agent-prefs] failed to write agent-preferences.json");
+        }
+        // adopt the merged copy so this tab also sees other tabs' changes
+        agentPrefsMap.clear();
+        for (const [key, prefs] of Object.entries(obj)) {
+            agentPrefsMap.set(key, prefs);
+        }
+    };
+    const next = prefsWriteChain.then(run, run);
+    prefsWriteChain = next.catch((e) => console.error("[agent-prefs] update failed", e));
+    return next;
 }
 
 function getAgentPrefs(agentName: string): AgentPrefs {
@@ -201,14 +282,15 @@ function getAgentPrefs(agentName: string): AgentPrefs {
 
 async function setAgentPref(agentName: string, key: string, value: string | null): Promise<void> {
     const name = agentName.toLowerCase();
-    const prefs = agentPrefsMap.get(name) ?? {};
-    if (value == null) {
-        delete prefs[key];
-    } else {
-        prefs[key] = value;
-    }
-    agentPrefsMap.set(name, prefs);
-    await saveAgentPreferences();
+    await updatePrefsFile((allPrefs) => {
+        const prefs = { ...(allPrefs[name] ?? {}) };
+        if (value == null) {
+            delete prefs[key];
+        } else {
+            prefs[key] = value;
+        }
+        allPrefs[name] = prefs;
+    });
 }
 
 function getGlobalConfig(): GlobalConfig {
@@ -264,22 +346,24 @@ async function setGlobalConfig(partial: Partial<GlobalConfig>): Promise<void> {
             resolveRemoteTmuxPath();
         }
     }
-    // Persist all fields to _global key in prefs file
-    const globalPrefs = agentPrefsMap.get("_global") ?? {};
-    const keys: (keyof GlobalConfig)[] = [
-        "remoteHost", "remoteTmuxPath", "repoBasePath",
-        "agentsPath", "githubOrg", "plausibleApiKey", "plausibleSiteId",
-        "cloudSyncUrl", "cloudDevicesUrl", "cloudOAuthClientId", "cloudOAuthClientSecret",
-    ];
-    for (const key of keys) {
-        if (updated[key] != null) {
-            globalPrefs[key] = updated[key];
-        } else {
-            delete globalPrefs[key];
+    // Persist only the changed fields into the _global key of the on-disk prefs file
+    await updatePrefsFile((allPrefs) => {
+        const globalPrefs = { ...(allPrefs["_global"] ?? {}) };
+        for (const key of GlobalConfigKeys) {
+            if (!(key in partial)) continue;
+            if (partial[key] != null) {
+                globalPrefs[key] = partial[key];
+            } else {
+                delete globalPrefs[key];
+            }
         }
-    }
-    agentPrefsMap.set("_global", globalPrefs);
-    await saveAgentPreferences();
+        allPrefs["_global"] = globalPrefs;
+    });
+    // pick up _global changes other tabs may have written
+    globalStore.set(globalConfigAtom, {
+        ...globalConfigFromPrefs(agentPrefsMap.get("_global") ?? {}),
+        ...partial,
+    });
 }
 
 // Backward compat alias
@@ -287,8 +371,13 @@ async function setRemoteConfig(partial: Partial<GlobalConfig>): Promise<void> {
     return setGlobalConfig(partial);
 }
 
-// Load prefs on module init
-loadAgentPreferences();
+// Load prefs on module init, then auto-detect the remote tmux path if a host is set without one
+loadAgentPreferences().then(() => {
+    const config = getGlobalConfig();
+    if (config.remoteHost && !config.remoteTmuxPath) {
+        resolveRemoteTmuxPath();
+    }
+});
 
 // --- Tmux Path Resolution (Local + Remote) ---
 
@@ -338,7 +427,7 @@ async function resolveRemoteTmuxPath(): Promise<string> {
         return REMOTE_TMUX_FALLBACK;
     }
     try {
-        const result = await getApi().execCommand(`ssh ${remote.remoteHost} "which tmux"`);
+        const result = await getApi().execCommand(sshCommand(remote.remoteHost, ["which", "tmux"]));
         const path = result.stdout?.trim();
         if (path) {
             resolvedRemoteTmuxPath = path;
@@ -369,20 +458,54 @@ function getTmuxCmd(): string {
 // Resolve local on module load
 resolveLocalTmuxPath();
 
+// --- Tmux Command Builders ---
+
+/** A /bin/sh command running tmux with `args`, locally or on the configured remote host. */
+function buildTmuxCommand(args: string[], opts?: { tty?: boolean }): string {
+    const remote = getRemoteConfig();
+    const tmux = getTmuxCmd();
+    if (remote?.remoteHost) {
+        return sshCommand(remote.remoteHost, [tmux, ...args], opts);
+    }
+    return shellJoin([tmux, ...args]);
+}
+
+/**
+ * Init script (cmd:initscript.zsh) that attaches to a tmux session, creating it if it's missing
+ * (`new-session -A`). `exec` replaces the pane's shell, so when tmux/ssh exits (detach, dropped
+ * connection, dead session) the pane shows the process as done and Enter replays this script to
+ * re-attach, instead of leaving a plain local shell under the agent's header.
+ * Returns null (and warns) if the session name isn't safe.
+ */
+function buildTmuxAttachInitScript(sessionName: string, cwd?: string): string | null {
+    if (!isSafeSessionName(sessionName)) {
+        console.warn("[tmux] refusing unsafe session name", JSON.stringify(sessionName));
+        return null;
+    }
+    const args = ["new-session", "-A", "-s", sessionName];
+    if (cwd) {
+        args.push("-c", cwd);
+    }
+    return `exec ${buildTmuxCommand(args, { tty: true })}\n`;
+}
+
+/** Directory an agent's tmux session starts in (same as Crew's spawn), or "" if agentsPath isn't set. */
+function getAgentDir(agentKey: string): string {
+    const agentsDir = getAgentsPath();
+    return agentsDir ? `${agentsDir}/agent-${agentKey.toLowerCase()}` : "";
+}
+
 // --- Tmux Session Switching via ForceRestart ---
 
 async function forceRestartWithAgent(blockId: string, agentName: string | null): Promise<void> {
     const tabId = globalStore.get(atoms.staticTabId);
-    const remote = getRemoteConfig();
-    const tmux = getTmuxCmd();
 
     let initScript: string | null = null;
     if (agentName) {
         const session = agentName.toLowerCase();
-        if (remote?.remoteHost) {
-            initScript = `ssh ${remote.remoteHost} -t "${tmux} attach -t ${session}"\n`;
-        } else {
-            initScript = `${tmux} attach -t ${session}\n`;
+        initScript = buildTmuxAttachInitScript(session, getAgentDir(session));
+        if (initScript == null) {
+            return;
         }
     }
 
@@ -399,16 +522,19 @@ async function forceRestartWithAgent(blockId: string, agentName: string | null):
 }
 
 export {
-    agentsAtom,
     AgentColorTable,
+    agentsAtom,
+    buildTmuxAttachInitScript,
+    buildTmuxCommand,
     forceRestartWithAgent,
     getAgentColor,
+    getAgentDir,
     getAgentInfo,
     getAgentPrefs,
-    getGithubOrg,
-    getGlobalConfig,
     getAgentsPath,
     getCloudSyncConfig,
+    getGithubOrg,
+    getGlobalConfig,
     getPlausibleConfig,
     getRemoteConfig,
     getRemoteTmuxPath,

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { BlockNodeModel } from "@/app/block/blocktypes";
-import { getRemoteConfig, getTmuxCmd } from "@/app/store/agents";
+import { buildTmuxCommand, getRemoteConfig, getTmuxCmd } from "@/app/store/agents";
 import { getApi, WOS } from "@/app/store/global";
 import type { TabModel } from "@/app/store/tab-model";
+import { isSafeSessionName, shellJoin, shellQuote, sshCommand } from "@/util/shellquote";
 import * as jotai from "jotai";
 import * as React from "react";
 
@@ -38,7 +39,11 @@ const QUEUE_COLOR = "#e879f9"; // fuchsia — queued/relay items
 const DRAFTS_FILE = "hopper-drafts.json";
 const MACROS_FILE = "hopper-macros.json";
 const QUEUE_FILE = "hopper-queue.json";
-const INBOX_PATH = "~/.claude/hooks/hopper-inbox.jsonl";
+// Agents append to the inbox (drop box); the Hopper consumes it atomically and moves regular
+// messages into the kept file, which only the Hopper writes. Both live on the host the agents run
+// on (the remote host in remote mode). Paths are used inside double quotes so $HOME expands.
+const INBOX_PATH = "$HOME/.claude/hooks/hopper-inbox.jsonl";
+const INBOX_KEPT_PATH = "$HOME/.claude/hooks/hopper-inbox.kept.jsonl";
 
 function agentColor(name: string): string {
     return AGENT_COLORS[name.toLowerCase()] || FALLBACK_COLOR;
@@ -87,6 +92,7 @@ type QueuedPrompt = {
     createdAt: string;
     status: "waiting" | "sent";
     expectsPayload?: boolean; // if true, next relay should include a payload
+    relayFrom?: string; // agent whose relay signal fires this prompt (set when that agent is sent the relay instruction)
 };
 
 // --- Relay Instruction ---
@@ -126,11 +132,32 @@ async function writeJsonFile<T>(fileName: string, data: T): Promise<void> {
     await getApi().writeTextFile(configDir + "/" + fileName, JSON.stringify(data, null, 2));
 }
 
-async function readInbox(): Promise<InboxMessage[]> {
-    const result = await getApi().execCommand(`cat ${INBOX_PATH} 2>/dev/null || true`);
-    if (!result.stdout?.trim()) return [];
+// Run a /bin/sh script on the host the agents live on (remote host in remote mode).
+function hostShellCommand(script: string): string {
+    const remote = getRemoteConfig();
+    if (remote?.remoteHost) {
+        return sshCommand(remote.remoteHost, ["sh", "-c", script]);
+    }
+    return script;
+}
+
+function toBase64(text: string): string {
+    const bytes = new TextEncoder().encode(text);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) {
+        bin += String.fromCharCode(bytes[i]);
+    }
+    return btoa(bin);
+}
+
+// `base64 -d` decodes on both macOS and GNU coreutils
+function base64DecodeCmd(text: string): string {
+    return `printf '%s' ${shellQuote(toBase64(text))} | base64 -d`;
+}
+
+function parseInboxLines(stdout: string): InboxMessage[] {
     const messages: InboxMessage[] = [];
-    for (const line of result.stdout.trim().split("\n")) {
+    for (const line of (stdout ?? "").split("\n")) {
         if (!line.trim()) continue;
         try {
             messages.push(JSON.parse(line));
@@ -141,34 +168,64 @@ async function readInbox(): Promise<InboxMessage[]> {
     return messages;
 }
 
-async function writeInbox(messages: InboxMessage[]): Promise<void> {
-    const content = messages.map((m) => JSON.stringify(m)).join("\n");
-    await getApi().execCommand(`mkdir -p ~/.claude/hooks`);
-    await getApi().execCommand(
-        `cat > ${INBOX_PATH} << 'HOPPER_EOF'\n${content}\nHOPPER_EOF`
-    );
+// Atomically take everything agents have appended so far: after the mv, new appends go to a
+// fresh inbox file, so nothing written between the read and the cleanup is lost.
+async function consumeInbox(): Promise<InboxMessage[]> {
+    const script =
+        `f="${INBOX_PATH}"; c="$f.consume.$$"; ` + `[ -s "$f" ] || exit 0; mv "$f" "$c" && cat "$c" && rm -f "$c"`;
+    const result = await getApi().execCommand(hostShellCommand(script));
+    return parseInboxLines(result.stdout);
+}
+
+// Messages the Hopper has kept for display (only the Hopper writes this file)
+async function readKeptInbox(): Promise<InboxMessage[]> {
+    const result = await getApi().execCommand(hostShellCommand(`cat "${INBOX_KEPT_PATH}" 2>/dev/null || true`));
+    return parseInboxLines(result.stdout);
+}
+
+async function appendKeptInbox(messages: InboxMessage[]): Promise<void> {
+    if (messages.length === 0) return;
+    const content = messages.map((m) => JSON.stringify(m)).join("\n") + "\n";
+    const script = `mkdir -p "$HOME/.claude/hooks" && ${base64DecodeCmd(content)} >> "${INBOX_KEPT_PATH}"`;
+    await getApi().execCommand(hostShellCommand(script));
+}
+
+// Remove the first line equal to this message from the CURRENT kept file (one read-modify-write
+// in a single shell command). Kept lines are always written with JSON.stringify, so the
+// re-serialized message matches its line exactly.
+async function removeKeptInboxMessage(message: InboxMessage): Promise<void> {
+    const line = JSON.stringify(message);
+    const script =
+        `k="${INBOX_KEPT_PATH}"; [ -f "$k" ] || exit 0; ` +
+        `T="$(${base64DecodeCmd(line)})" && export T && ` +
+        `awk 'BEGIN{t=ENVIRON["T"]} !done && $0==t {done=1; next} {print}' "$k" > "$k.tmp.$$" && ` +
+        `mv "$k.tmp.$$" "$k"`;
+    await getApi().execCommand(hostShellCommand(script));
 }
 
 // --- Data Fetching ---
 
 async function fetchActiveSessions(): Promise<SessionInfo[]> {
-    const remote = getRemoteConfig();
-    const tmux = getTmuxCmd();
-
-    const listCmd = remote?.remoteHost
-        ? `ssh ${remote.remoteHost} "${tmux} list-sessions -F '#{session_name}' 2>/dev/null"`
-        : `${tmux} list-sessions -F '#{session_name}' 2>/dev/null`;
+    const listCmd = buildTmuxCommand(["list-sessions", "-F", "#{session_name}"]) + " 2>/dev/null";
 
     const result = await getApi().execCommand(listCmd);
     if (!result.stdout) return [];
 
-    const sessionNames = result.stdout.trim().split("\n").filter(Boolean);
+    // session names come from the (possibly remote) host: never put an unvalidated one in a command
+    const sessionNames = result.stdout
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .filter((name) => {
+            if (isSafeSessionName(name)) return true;
+            console.warn("[hopper] skipping unsafe tmux session name", JSON.stringify(name));
+            return false;
+        });
 
     const checks = await Promise.all(
         sessionNames.map(async (name) => {
-            const paneCmd = remote?.remoteHost
-                ? `ssh ${remote.remoteHost} "${tmux} list-panes -t ${name} -F '#{pane_current_command}' 2>/dev/null"`
-                : `${tmux} list-panes -t ${name} -F '#{pane_current_command}' 2>/dev/null`;
+            const paneCmd =
+                buildTmuxCommand(["list-panes", "-t", name, "-F", "#{pane_current_command}"]) + " 2>/dev/null";
             const cmdResult = await getApi().execCommand(paneCmd);
             const cmd = cmdResult.stdout?.trim() || "";
             return { name, hasClaudeCode: cmd === "node" };
@@ -185,24 +242,28 @@ async function sendToAgent(
     text: string,
     autoSubmit: boolean
 ): Promise<{ ok: boolean; error?: string }> {
+    if (!isSafeSessionName(sessionName)) {
+        console.warn("[hopper] refusing unsafe session name", JSON.stringify(sessionName));
+        return { ok: false, error: "invalid session name" };
+    }
     const remote = getRemoteConfig();
     const tmux = getTmuxCmd();
 
     let cmd: string;
     if (remote?.remoteHost) {
         // Base64 encode to avoid shell escaping issues over SSH
-        const bytes = new TextEncoder().encode(text);
-        const b64 = btoa(String.fromCharCode(...bytes));
-        let tmuxChain = `echo '${b64}' | base64 -D | ${tmux} load-buffer - && ${tmux} paste-buffer -t '${sessionName}'`;
+        let tmuxChain =
+            `${base64DecodeCmd(text)} | ${shellJoin([tmux, "load-buffer", "-"])} && ` +
+            shellJoin([tmux, "paste-buffer", "-t", sessionName]);
         if (autoSubmit) {
-            tmuxChain += ` && sleep 0.1 && ${tmux} send-keys -t '${sessionName}' Enter`;
+            tmuxChain += ` && sleep 0.1 && ${shellJoin([tmux, "send-keys", "-t", sessionName, "Enter"])}`;
         }
-        cmd = `ssh ${remote.remoteHost} "${tmuxChain}"`;
+        cmd = sshCommand(remote.remoteHost, ["sh", "-c", tmuxChain]);
     } else {
-        const escaped = text.replace(/'/g, "'\\''");
-        cmd = `${tmux} set-buffer '${escaped}' && ${tmux} paste-buffer -t '${sessionName}'`;
+        cmd =
+            shellJoin([tmux, "set-buffer", "--", text]) + " && " + shellJoin([tmux, "paste-buffer", "-t", sessionName]);
         if (autoSubmit) {
-            cmd += ` && sleep 0.1 && ${tmux} send-keys -t '${sessionName}' Enter`;
+            cmd += ` && sleep 0.1 && ${shellJoin([tmux, "send-keys", "-t", sessionName, "Enter"])}`;
         }
     }
 
@@ -213,11 +274,7 @@ async function sendToAgent(
     return { ok: true };
 }
 
-async function sendToMultipleAgents(
-    agents: string[],
-    text: string,
-    autoSubmit: boolean
-): Promise<SendResult> {
+async function sendToMultipleAgents(agents: string[], text: string, autoSubmit: boolean): Promise<SendResult> {
     const results = await Promise.all(
         agents.map(async (agent) => {
             const r = await sendToAgent(agent, text, autoSubmit);
@@ -289,15 +346,7 @@ const smallBtnStyle: React.CSSProperties = {
 // --- Components ---
 
 const AgentChip = React.memo(
-    ({
-        session,
-        selected,
-        onToggle,
-    }: {
-        session: SessionInfo;
-        selected: boolean;
-        onToggle: () => void;
-    }) => {
+    ({ session, selected, onToggle }: { session: SessionInfo; selected: boolean; onToggle: () => void }) => {
         const agentClr = agentColor(session.name);
         return (
             <button
@@ -323,7 +372,11 @@ const AgentChip = React.memo(
                         width: 6,
                         height: 6,
                         borderRadius: "50%",
-                        background: selected ? SELECTED_COLOR : session.hasClaudeCode ? agentClr : "var(--secondary-text-color)",
+                        background: selected
+                            ? SELECTED_COLOR
+                            : session.hasClaudeCode
+                              ? agentClr
+                              : "var(--secondary-text-color)",
                         display: "inline-block",
                     }}
                 />
@@ -379,15 +432,7 @@ CollapsibleSection.displayName = "CollapsibleSection";
 // --- Inbox Entry ---
 
 const InboxEntry = React.memo(
-    ({
-        message,
-        onLoad,
-        onDismiss,
-    }: {
-        message: InboxMessage;
-        onLoad: () => void;
-        onDismiss: () => void;
-    }) => {
+    ({ message, onLoad, onDismiss }: { message: InboxMessage; onLoad: () => void; onDismiss: () => void }) => {
         const fromColor = agentColor(message.from);
         const msgText = message.msg || "";
         const preview = msgText.length > 80 ? msgText.slice(0, 80) + "..." : msgText;
@@ -410,7 +455,10 @@ const InboxEntry = React.memo(
                         </span>
                         {message.to && (
                             <>
-                                <i className="fa-sharp fa-solid fa-arrow-right" style={{ fontSize: 7, color: "var(--secondary-text-color)" }} />
+                                <i
+                                    className="fa-sharp fa-solid fa-arrow-right"
+                                    style={{ fontSize: 7, color: "var(--secondary-text-color)" }}
+                                />
                                 <span
                                     className="text-[9px] font-bold uppercase"
                                     style={{ color: agentColor(message.to) }}
@@ -428,11 +476,7 @@ const InboxEntry = React.memo(
                     <button onClick={onLoad} style={smallBtnStyle} title="Load into textarea">
                         <i className="fa-sharp fa-solid fa-arrow-up-right" />
                     </button>
-                    <button
-                        onClick={onDismiss}
-                        style={{ ...smallBtnStyle, color: "#f87171" }}
-                        title="Dismiss"
-                    >
+                    <button onClick={onDismiss} style={{ ...smallBtnStyle, color: "#f87171" }} title="Dismiss">
                         <i className="fa-sharp fa-solid fa-xmark" />
                     </button>
                 </div>
@@ -445,15 +489,7 @@ InboxEntry.displayName = "InboxEntry";
 // --- Draft Entry ---
 
 const DraftEntry = React.memo(
-    ({
-        draft,
-        onLoad,
-        onDelete,
-    }: {
-        draft: Draft;
-        onLoad: () => void;
-        onDelete: () => void;
-    }) => {
+    ({ draft, onLoad, onDelete }: { draft: Draft; onLoad: () => void; onDelete: () => void }) => {
         const firstLine = draft.text.split("\n")[0];
         const preview = firstLine.length > 70 ? firstLine.slice(0, 70) + "..." : firstLine;
         return (
@@ -467,7 +503,10 @@ const DraftEntry = React.memo(
                             {draft.label}
                         </span>
                     )}
-                    <span className="text-[11px] text-muted truncate" style={{ display: "inline-block", maxWidth: "100%" }}>
+                    <span
+                        className="text-[11px] text-muted truncate"
+                        style={{ display: "inline-block", maxWidth: "100%" }}
+                    >
                         {preview}
                     </span>
                 </div>
@@ -475,11 +514,7 @@ const DraftEntry = React.memo(
                     <button onClick={onLoad} style={smallBtnStyle} title="Load into editor">
                         <i className="fa-sharp fa-solid fa-arrow-up-right" />
                     </button>
-                    <button
-                        onClick={onDelete}
-                        style={{ ...smallBtnStyle, color: "#f87171" }}
-                        title="Delete draft"
-                    >
+                    <button onClick={onDelete} style={{ ...smallBtnStyle, color: "#f87171" }} title="Delete draft">
                         <i className="fa-sharp fa-solid fa-trash" />
                     </button>
                 </div>
@@ -533,11 +568,7 @@ const MacroEntry = React.memo(
                     <button onClick={onEdit} style={smallBtnStyle} title="Edit macro">
                         <i className="fa-sharp fa-solid fa-pen" />
                     </button>
-                    <button
-                        onClick={onDelete}
-                        style={{ ...smallBtnStyle, color: "#f87171" }}
-                        title="Delete macro"
-                    >
+                    <button onClick={onDelete} style={{ ...smallBtnStyle, color: "#f87171" }} title="Delete macro">
                         <i className="fa-sharp fa-solid fa-trash" />
                     </button>
                 </div>
@@ -622,15 +653,7 @@ MacroEditor.displayName = "MacroEditor";
 // --- Queued Prompt Entry ---
 
 const QueueEntry = React.memo(
-    ({
-        queued,
-        onDelete,
-        onFireNow,
-    }: {
-        queued: QueuedPrompt;
-        onDelete: () => void;
-        onFireNow: () => void;
-    }) => {
+    ({ queued, onDelete, onFireNow }: { queued: QueuedPrompt; onDelete: () => void; onFireNow: () => void }) => {
         const color = agentColor(queued.targetAgent);
         const preview = queued.text.length > 60 ? queued.text.slice(0, 60) + "..." : queued.text;
         const isWaiting = queued.status === "waiting";
@@ -686,11 +709,7 @@ const QueueEntry = React.memo(
                             <i className="fa-sharp fa-solid fa-bolt" />
                         </button>
                     )}
-                    <button
-                        onClick={onDelete}
-                        style={{ ...smallBtnStyle, color: "#f87171" }}
-                        title="Remove from queue"
-                    >
+                    <button onClick={onDelete} style={{ ...smallBtnStyle, color: "#f87171" }} title="Remove from queue">
                         <i className="fa-sharp fa-solid fa-xmark" />
                     </button>
                 </div>
@@ -731,17 +750,24 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
     const [queueOpen, setQueueOpen] = React.useState(true);
     const [queuePayloadMode, setQueuePayloadMode] = React.useState(false);
 
-    // Ref for queue to use in interval callback without stale closure
+    // Ref for queue to use in interval callback without stale closure. Always updated
+    // synchronously through commitQueue so back-to-back updates never read a stale queue.
     const queueRef = React.useRef<QueuedPrompt[]>([]);
-    queueRef.current = queue;
+    const commitQueue = React.useCallback(async (updated: QueuedPrompt[], persist = true) => {
+        queueRef.current = updated;
+        setQueue(updated);
+        if (persist) {
+            await writeJsonFile(QUEUE_FILE, updated);
+        }
+    }, []);
 
     // --- Load persisted data on mount ---
 
     React.useEffect(() => {
         readJsonFile<Draft[]>(DRAFTS_FILE).then((d) => d && setDrafts(d));
         readJsonFile<Macro[]>(MACROS_FILE).then((m) => m && setMacros(m));
-        readJsonFile<QueuedPrompt[]>(QUEUE_FILE).then((q) => q && setQueue(q));
-        readInbox().then(setInbox);
+        readJsonFile<QueuedPrompt[]>(QUEUE_FILE).then((q) => q && commitQueue(q, false));
+        readKeptInbox().then(setInbox);
     }, []);
 
     // --- Sessions polling ---
@@ -773,29 +799,25 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
             }
 
             // Check if there are more waiting prompts AFTER this one
-            const currentQueue = queueRef.current;
-            const waitingAfter = currentQueue.filter(
-                (q) => q.status === "waiting" && q.id !== qp.id
-            );
+            const waitingAfter = queueRef.current.filter((q) => q.status === "waiting" && q.id !== qp.id);
             // If more dominoes remain, append relay instruction so the chain continues
-            if (waitingAfter.length > 0) {
-                const nextExpectsPayload = waitingAfter[0].expectsPayload ?? false;
-                promptText += buildRelayInstruction(qp.targetAgent, nextExpectsPayload);
+            const nextQp = waitingAfter.length > 0 ? waitingAfter[0] : null;
+            if (nextQp) {
+                promptText += buildRelayInstruction(qp.targetAgent, nextQp.expectsPayload ?? false);
             }
             const result = await sendToAgent(qp.targetAgent, promptText, true);
             if (result.ok) {
-                // Mark as sent, then remove after brief display
-                const updated = queueRef.current.map((q) =>
-                    q.id === qp.id ? { ...q, status: "sent" as const } : q
-                );
-                setQueue(updated);
-                await writeJsonFile(QUEUE_FILE, updated);
+                // Mark as sent, and have the next prompt wait for this agent's relay signal
+                const updated = queueRef.current.map((q) => {
+                    if (q.id === qp.id) return { ...q, status: "sent" as const };
+                    if (nextQp && q.id === nextQp.id) return { ...q, relayFrom: qp.targetAgent };
+                    return q;
+                });
+                await commitQueue(updated);
 
                 // Remove from queue after 3 seconds
-                setTimeout(async () => {
-                    const cleaned = queueRef.current.filter((q) => q.id !== qp.id);
-                    setQueue(cleaned);
-                    await writeJsonFile(QUEUE_FILE, cleaned);
+                setTimeout(() => {
+                    commitQueue(queueRef.current.filter((q) => q.id !== qp.id));
                 }, 3000);
 
                 setLastResult({ ok: true, agents: [qp.targetAgent], failures: [] });
@@ -803,34 +825,49 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                 setLastResult({ ok: false, agents: [], failures: [qp.targetAgent] });
             }
         },
-        []
+        [commitQueue]
     );
 
     // --- Inbox polling + relay signal detection ---
 
+    const pollingRef = React.useRef(false);
     React.useEffect(() => {
         const interval = setInterval(async () => {
-            const msgs = await readInbox();
+            if (pollingRef.current) return; // previous poll still running (slow ssh)
+            pollingRef.current = true;
+            try {
+                const msgs = await consumeInbox();
 
-            // Check for relay signals
-            const signals = msgs.filter((m) => m.signal === "relay");
-            const nonSignals = msgs.filter((m) => m.signal !== "relay");
+                // Regular messages move to the kept file; relay signals are acted on and dropped
+                const signals = msgs.filter((m) => m.signal === "relay");
+                const nonSignals = msgs.filter((m) => m.signal !== "relay");
+                await appendKeptInbox(nonSignals);
 
-            if (signals.length > 0) {
-                // Remove signals from inbox file
-                await writeInbox(nonSignals);
-
-                // Fire the first waiting queued prompt for each signal
-                const currentQueue = queueRef.current;
-                const waiting = currentQueue.filter((q) => q.status === "waiting");
-
-                for (let i = 0; i < Math.min(signals.length, waiting.length); i++) {
-                    const signalPayload = signals[i].payload;
-                    await fireQueuedPrompt(waiting[i], signalPayload);
+                // Each signal fires the head of the waiting queue only if it comes from the agent
+                // that head is waiting on
+                for (const signal of signals) {
+                    const head = queueRef.current.find((q) => q.status === "waiting");
+                    const from = (signal.from ?? "").toLowerCase();
+                    if (head && head.relayFrom && head.relayFrom.toLowerCase() === from) {
+                        await fireQueuedPrompt(head, signal.payload);
+                    } else {
+                        console.warn(
+                            "[hopper] ignoring relay signal from",
+                            signal.from,
+                            "- queue head waits on",
+                            head?.relayFrom
+                        );
+                    }
                 }
-            }
 
-            setInbox(nonSignals);
+                if (nonSignals.length > 0) {
+                    setInbox(await readKeptInbox());
+                }
+            } catch (e) {
+                console.error("[hopper] inbox poll failed", e);
+            } finally {
+                pollingRef.current = false;
+            }
         }, 5000); // Poll every 5s for faster relay response
         return () => clearInterval(interval);
     }, [fireQueuedPrompt]);
@@ -857,16 +894,33 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
         setSending(true);
         setLastResult(null);
 
-        // If there are queued prompts waiting, auto-append relay instruction
-        const waitingQueue = queue.filter((q) => q.status === "waiting");
-        let finalText = text;
-        if (waitingQueue.length > 0) {
-            const agents = Array.from(selectedAgents);
-            const nextExpectsPayload = waitingQueue[0].expectsPayload ?? false;
-            finalText = text + buildRelayInstruction(agents[0], nextExpectsPayload);
+        // If there are queued prompts waiting, auto-append the relay instruction to the first
+        // target only, so exactly one agent signals, and the queue head waits on that agent.
+        // Skip it if the head is already waiting on another agent's relay (no competing signals).
+        const targets = Array.from(selectedAgents);
+        const head = queueRef.current.find((q) => q.status === "waiting");
+        let result: SendResult;
+        if (head && !head.relayFrom) {
+            const [relayAgent, ...others] = targets;
+            const relayText = text + buildRelayInstruction(relayAgent, head.expectsPayload ?? false);
+            const [first, rest] = await Promise.all([
+                sendToAgent(relayAgent, relayText, autoSubmit),
+                sendToMultipleAgents(others, text, autoSubmit),
+            ]);
+            if (first.ok) {
+                await commitQueue(
+                    queueRef.current.map((q) => (q.id === head.id ? { ...q, relayFrom: relayAgent } : q))
+                );
+            }
+            const failures = [...(first.ok ? [] : [relayAgent]), ...rest.failures];
+            result = {
+                ok: failures.length === 0,
+                agents: [...(first.ok ? [relayAgent] : []), ...rest.agents],
+                failures,
+            };
+        } else {
+            result = await sendToMultipleAgents(targets, text, autoSubmit);
         }
-
-        const result = await sendToMultipleAgents(Array.from(selectedAgents), finalText, autoSubmit);
         setLastResult(result);
         setSending(false);
 
@@ -874,7 +928,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
             setText("");
             textareaRef.current?.focus();
         }
-    }, [selectedAgents, text, autoSubmit, queue]);
+    }, [selectedAgents, text, autoSubmit, commitQueue]);
 
     const handleKeyDown = React.useCallback(
         (e: React.KeyboardEvent) => {
@@ -899,22 +953,18 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
             status: "waiting" as const,
             expectsPayload: queuePayloadMode,
         }));
-        const updated = [...queue, ...newEntries];
-        setQueue(updated);
-        await writeJsonFile(QUEUE_FILE, updated);
+        await commitQueue([...queueRef.current, ...newEntries]);
         setText("");
         setQueueOpen(true);
         setQueuePayloadMode(false);
         textareaRef.current?.focus();
-    }, [text, selectedAgents, queue]);
+    }, [text, selectedAgents, commitQueue]);
 
     const removeFromQueue = React.useCallback(
         async (id: string) => {
-            const updated = queue.filter((q) => q.id !== id);
-            setQueue(updated);
-            await writeJsonFile(QUEUE_FILE, updated);
+            await commitQueue(queueRef.current.filter((q) => q.id !== id));
         },
-        [queue]
+        [commitQueue]
     );
 
     const fireNow = React.useCallback(
@@ -960,9 +1010,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
     const saveMacro = React.useCallback(
         async (name: string, macroText: string) => {
             if (editingMacro) {
-                const updated = macros.map((m) =>
-                    m.id === editingMacro.id ? { ...m, name, text: macroText } : m
-                );
+                const updated = macros.map((m) => (m.id === editingMacro.id ? { ...m, name, text: macroText } : m));
                 setMacros(updated);
                 await writeJsonFile(MACROS_FILE, updated);
                 setEditingMacro(null);
@@ -1004,29 +1052,23 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
 
     // --- Inbox ---
 
-    const loadInboxMessage = React.useCallback(
-        (msg: InboxMessage) => {
-            setText(msg.msg || "");
-            if (msg.to) {
-                setSelectedAgents((prev) => {
-                    const next = new Set(prev);
-                    next.add(msg.to.toLowerCase());
-                    return next;
-                });
-            }
-            textareaRef.current?.focus();
-        },
-        []
-    );
+    const loadInboxMessage = React.useCallback((msg: InboxMessage) => {
+        setText(msg.msg || "");
+        if (msg.to) {
+            setSelectedAgents((prev) => {
+                const next = new Set(prev);
+                next.add(msg.to.toLowerCase());
+                return next;
+            });
+        }
+        textareaRef.current?.focus();
+    }, []);
 
-    const dismissInboxMessage = React.useCallback(
-        async (idx: number) => {
-            const updated = inbox.filter((_, i) => i !== idx);
-            setInbox(updated);
-            await writeInbox(updated);
-        },
-        [inbox]
-    );
+    const dismissInboxMessage = React.useCallback(async (message: InboxMessage) => {
+        // remove from the current file on disk, never by rewriting it from React state
+        await removeKeptInboxMessage(message);
+        setInbox(await readKeptInbox());
+    }, []);
 
     // --- Derived ---
 
@@ -1148,7 +1190,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                                 key={idx}
                                 message={msg}
                                 onLoad={() => loadInboxMessage(msg)}
-                                onDismiss={() => dismissInboxMessage(idx)}
+                                onDismiss={() => dismissInboxMessage(msg)}
                             />
                         ))
                     )}
@@ -1188,7 +1230,8 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                             }}
                         >
                             <i className="fa-sharp fa-solid fa-link" style={{ fontSize: 9 }} />
-                            Relay mode: Send will auto-append relay instruction so the agent signals the Hopper when done
+                            Relay mode: Send will auto-append relay instruction so the agent signals the Hopper when
+                            done
                         </div>
                     )}
                     <textarea
@@ -1196,9 +1239,10 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                         value={text}
                         onChange={(e) => setText(e.target.value)}
                         onKeyDown={handleKeyDown}
-                        placeholder={waitingCount > 0
-                            ? "Type the FIRST step prompt — relay instruction will be auto-appended..."
-                            : "Type your prompt here..."
+                        placeholder={
+                            waitingCount > 0
+                                ? "Type the FIRST step prompt — relay instruction will be auto-appended..."
+                                : "Type your prompt here..."
                         }
                         className="text-[12px]"
                         style={{
@@ -1206,9 +1250,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                             minHeight: 100,
                             resize: "vertical",
                             background: "rgba(255,255,255,0.03)",
-                            border: waitingCount > 0
-                                ? `1px solid ${QUEUE_COLOR}40`
-                                : "1px solid rgba(255,255,255,0.1)",
+                            border: waitingCount > 0 ? `1px solid ${QUEUE_COLOR}40` : "1px solid rgba(255,255,255,0.1)",
                             borderRadius: 6,
                             padding: "10px 12px",
                             color: "var(--main-text-color)",
@@ -1241,7 +1283,10 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                                 onChange={(e) => setQueuePayloadMode(e.target.checked)}
                                 style={{ accentColor: "#fbbf24", cursor: "pointer", width: 12, height: 12 }}
                             />
-                            <span className="text-[9px]" style={{ color: queuePayloadMode ? "#fbbf24" : "var(--secondary-text-color)" }}>
+                            <span
+                                className="text-[9px]"
+                                style={{ color: queuePayloadMode ? "#fbbf24" : "var(--secondary-text-color)" }}
+                            >
                                 Payload
                             </span>
                         </label>
@@ -1289,11 +1334,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                         )
                     )}
                     {creatingMacro ? (
-                        <MacroEditor
-                            initial={null}
-                            onSave={saveMacro}
-                            onCancel={() => setCreatingMacro(false)}
-                        />
+                        <MacroEditor initial={null} onSave={saveMacro} onCancel={() => setCreatingMacro(false)} />
                     ) : (
                         <button
                             onClick={() => setCreatingMacro(true)}
@@ -1325,10 +1366,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                         <span className="text-[10px] text-muted">Auto-submit</span>
                     </label>
                     {statusText && (
-                        <span
-                            className="text-[10px]"
-                            style={{ color: lastResult?.ok ? "#22c55e" : "#ef4444" }}
-                        >
+                        <span className="text-[10px]" style={{ color: lastResult?.ok ? "#22c55e" : "#ef4444" }}>
                             {statusText}
                         </span>
                     )}
@@ -1340,9 +1378,7 @@ const HopperView: React.FC<ViewComponentProps<HopperViewModel>> = ({ model }) =>
                     style={{
                         background: canSend ? `${selectedColor}30` : "rgba(255,255,255,0.05)",
                         color: canSend ? selectedColor : "var(--secondary-text-color)",
-                        border: canSend
-                            ? `1px solid ${selectedColor}50`
-                            : "1px solid rgba(255,255,255,0.08)",
+                        border: canSend ? `1px solid ${selectedColor}50` : "1px solid rgba(255,255,255,0.08)",
                         cursor: canSend ? "pointer" : "default",
                         opacity: canSend ? 1 : 0.4,
                         transition: "all 0.15s",
