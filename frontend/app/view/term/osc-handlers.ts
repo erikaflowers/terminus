@@ -287,6 +287,10 @@ export function handleOsc16162Command(data: string, blockId: string, loaded: boo
         case "A": {
             rtInfo["shell:state"] = "ready";
             globalStore.set(termWrap.shellIntegrationStatusAtom, "ready");
+            // The shell is drawing its prompt, so whatever ran in the foreground has exited. If that was
+            // ssh/tmux and the connection dropped, the "mouse off" never arrived; the shell itself never
+            // turns mouse reporting on, so any mode still set here is stale (else scrolls flood the prompt).
+            termWrap.resetStaleInputModes("shell prompt");
             const marker = terminal.registerMarker(0);
             if (marker) {
                 termWrap.promptMarkers.push(marker);

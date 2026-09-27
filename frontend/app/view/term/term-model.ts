@@ -499,9 +499,9 @@ export class TermViewModel implements ViewModel {
     }
 
     sendDataToController(data: string) {
-        if (MouseReportRegex.test(data) && globalStore.get(this.shellProcStatus) != "running") {
-            // no live process can have asked for mouse reports; don't type them into the shell
-            this.resetStaleInputModes("mouse report with no running process");
+        if (MouseReportRegex.test(data) && this.isMouseReportStale()) {
+            // no live program can have asked for mouse reports; don't type them into the shell
+            this.resetStaleInputModes("stale mouse report");
             return;
         }
         const b64data = stringToBase64(data);
@@ -567,6 +567,16 @@ export class TermViewModel implements ViewModel {
         if (wasRunning != isRunning) {
             this.resetStaleInputModes(`shellproc ${prev.shellprocstatus} -> ${next.shellprocstatus}`);
         }
+    }
+
+    // Mouse reports are stale when no process is running, or when shell integration says the shell is
+    // sitting at its prompt (the program that enabled mouse reporting, e.g. ssh+tmux, has exited).
+    isMouseReportStale(): boolean {
+        if (globalStore.get(this.shellProcStatus) != "running") {
+            return true;
+        }
+        const siAtom = this.termRef.current?.shellIntegrationStatusAtom;
+        return siAtom != null && globalStore.get(siAtom) == "ready";
     }
 
     resetStaleInputModes(reason: string) {
