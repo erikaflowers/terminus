@@ -107,11 +107,41 @@ func TestMoveBlockToTab(t *testing.T) {
 		t.Errorf("destination layout actions = %+v, want one focused insert", dstActs)
 	}
 
+	// cross-window: into a tab of another workspace (window), and back
+	ws2 := &waveobj.Workspace{OID: uuid.NewString(), TabIds: []string{}}
+	if err := wstore.DBInsert(ctx, ws2); err != nil {
+		t.Fatal(err)
+	}
+	otherTabId, err := createTab(ctx, ws2.OID, "other window", true, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MoveBlockToTab(ctx, dstTabId, otherTabId, block.OID); err != nil {
+		t.Fatalf("cross-window move: %v", err)
+	}
+	if wsId, _ := wstore.DBFindWorkspaceForTabId(ctx, otherTabId); wsId != ws2.OID {
+		t.Fatalf("tab should belong to the second workspace")
+	}
+	other, _ := wstore.DBMustGet[*waveobj.Tab](ctx, otherTabId)
+	if len(other.BlockIds) != 1 || other.BlockIds[0] != block.OID {
+		t.Errorf("other window's tab blocks = %v", other.BlockIds)
+	}
+	if err := MoveBlockToTab(ctx, otherTabId, srcTabId, block.OID); err != nil {
+		t.Fatalf("move back: %v", err)
+	}
+	src, _ = wstore.DBMustGet[*waveobj.Tab](ctx, srcTabId)
+	if len(src.BlockIds) != 1 || src.BlockIds[0] != block.OID {
+		t.Errorf("block should be back in the original tab, got %v", src.BlockIds)
+	}
+	if b, _ := wstore.DBGet[*waveobj.Block](ctx, block.OID); b == nil {
+		t.Fatal("block must survive the round trip")
+	}
+
 	// errors: same tab, block not in source tab
-	if err := MoveBlockToTab(ctx, dstTabId, dstTabId, block.OID); err == nil {
+	if err := MoveBlockToTab(ctx, srcTabId, srcTabId, block.OID); err == nil {
 		t.Error("moving to the same tab should fail")
 	}
-	if err := MoveBlockToTab(ctx, srcTabId, dstTabId, block.OID); err == nil {
+	if err := MoveBlockToTab(ctx, dstTabId, otherTabId, block.OID); err == nil {
 		t.Error("moving a block that isn't in the source tab should fail")
 	}
 }

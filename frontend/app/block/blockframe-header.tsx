@@ -33,7 +33,7 @@ import * as jotai from "jotai";
 import * as React from "react";
 import { BlockFrameProps } from "./blocktypes";
 
-function handleHeaderContextMenu(
+async function handleHeaderContextMenu(
     e: React.MouseEvent<HTMLDivElement>,
     blockId: string,
     viewModel: ViewModel,
@@ -41,6 +41,8 @@ function handleHeaderContextMenu(
 ) {
     e.preventDefault();
     e.stopPropagation();
+    // other windows' tabs are loaded before the menu opens
+    const sendItems = await getSendBlockMenuItems(blockId);
     const magnified = globalStore.get(nodeModel.isMagnified);
     let menu: ContextMenuItem[] = [
         {
@@ -50,7 +52,7 @@ function handleHeaderContextMenu(
             },
         },
         { type: "separator" },
-        ...getSendBlockMenuItems(blockId),
+        ...sendItems,
         { type: "separator" },
         {
             label: "Copy BlockId",

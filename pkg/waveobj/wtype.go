@@ -169,6 +169,7 @@ type WorkspaceList []*WorkspaceListEntry
 type ActiveTabUpdate struct {
 	WorkspaceId    string `json:"workspaceid"`
 	NewActiveTabId string `json:"newactivetabid"`
+	Focus          bool   `json:"focus,omitempty"` // also bring that window to the front
 }
 
 type Workspace struct {

@@ -126,13 +126,20 @@ function handleWSEvent(evtMsg: WSEventType) {
                 ww.destroy(); // bypass the "are you sure?" dialog
             }
         } else if (evtMsg.eventtype == "electron:updateactivetab") {
-            const activeTabUpdate: { workspaceid: string; newactivetabid: string } = evtMsg.data;
+            const activeTabUpdate: { workspaceid: string; newactivetabid: string; focus?: boolean } = evtMsg.data;
             console.log("electron:updateactivetab", activeTabUpdate);
             const ww = getWaveWindowByWorkspaceId(activeTabUpdate.workspaceid);
             if (ww == null) {
                 return;
             }
             await ww.setActiveTab(activeTabUpdate.newactivetabid, false);
+            if (activeTabUpdate.focus) {
+                // e.g. a pane was sent here from another window: bring this window forward
+                if (ww.isMinimized()) {
+                    ww.restore();
+                }
+                ww.focus();
+            }
         } else {
             console.log("unhandled electron ws eventtype", evtMsg.eventtype);
         }

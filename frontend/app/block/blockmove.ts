@@ -32,12 +32,25 @@ async function closeTabIfEmptied(srcTabId: string, wasOnlyBlock: boolean) {
     }
 }
 
-/** Move a block to `dstTabId`, or to a new tab in this window when dstTabId is null. Follows it there. */
-export async function sendBlockToTab(blockId: string, dstTabId: string | null) {
+/**
+ * Move a block to `dstTabId` (a tab in this or any other window), or to a new tab in `dstWorkspaceId`
+ * (this window's workspace when omitted). Same-window moves follow the pane here; for another window the
+ * backend switches that window to the tab and brings it forward.
+ */
+export async function sendBlockToTab(blockId: string, dstTabId: string | null, dstWorkspaceId?: string) {
     const srcTabId = globalStore.get(atoms.staticTabId);
+    const ws = globalStore.get(atoms.workspace);
     const wasOnlyBlock = isOnlyBlockInTab(srcTabId, blockId);
-    const newTabId = await services.WorkspaceService.MoveBlockToTab(srcTabId, blockId, dstTabId ?? "");
-    setActiveTab(newTabId);
+    const newTabId = await services.WorkspaceService.MoveBlockToTab(
+        srcTabId,
+        blockId,
+        dstTabId ?? "",
+        dstWorkspaceId ?? ""
+    );
+    const sameWindow = (dstWorkspaceId ?? ws.oid) === ws.oid && (dstTabId == null || ws.tabids.includes(dstTabId));
+    if (sameWindow) {
+        setActiveTab(newTabId);
+    }
     await closeTabIfEmptied(srcTabId, wasOnlyBlock);
 }
 
@@ -49,8 +62,40 @@ export async function sendBlockToNewWindow(blockId: string) {
     await closeTabIfEmptied(srcTabId, wasOnlyBlock);
 }
 
-/** "Send to Tab ▸ [other tabs…, New Tab]" and "Send to New Window" for a pane's context menu. */
-export function getSendBlockMenuItems(blockId: string): ContextMenuItem[] {
+type OtherWindow = { workspaceId: string; label: string; tabs: { id: string; name: string }[] };
+
+// Other open windows and their tabs (their objects may not be loaded in this window yet).
+async function loadOtherWindows(): Promise<OtherWindow[]> {
+    const myWsId = globalStore.get(atoms.workspace)?.oid;
+    const entries = (await services.WorkspaceService.ListWorkspaces()) ?? [];
+    const rtn: OtherWindow[] = [];
+    for (const entry of entries) {
+        if (!entry.windowid || entry.workspaceid === myWsId) {
+            continue;
+        }
+        try {
+            const ws = await WOS.reloadWaveObject<Workspace>(WOS.makeORef("workspace", entry.workspaceid));
+            const tabs = await Promise.all(
+                (ws?.tabids ?? []).map(async (id) => {
+                    const tab = await WOS.reloadWaveObject<Tab>(WOS.makeORef("tab", id));
+                    return { id, name: tab?.name || "Untitled Tab" };
+                })
+            );
+            const tabNames = tabs.map((t) => t.name).join(", ");
+            const label = ws?.name || (tabNames.length > 40 ? tabNames.slice(0, 39) + "…" : tabNames) || "Window";
+            rtn.push({ workspaceId: entry.workspaceid, label, tabs });
+        } catch (e) {
+            console.log("send to window: couldn't load workspace", entry.workspaceid, e);
+        }
+    }
+    return rtn;
+}
+
+/**
+ * Context-menu items: "Send to Tab ▸ [this window's tabs…, New Tab]", "Send to Window ▸ [each other
+ * window ▸ its tabs…, New Tab]" (when other windows are open), and "Send to New Window".
+ */
+export async function getSendBlockMenuItems(blockId: string): Promise<ContextMenuItem[]> {
     const srcTabId = globalStore.get(atoms.staticTabId);
     const ws = globalStore.get(atoms.workspace);
     const tabItems: ContextMenuItem[] = [];
@@ -67,8 +112,35 @@ export function getSendBlockMenuItems(blockId: string): ContextMenuItem[] {
         tabItems.push({ type: "separator" });
     }
     tabItems.push({ label: "New Tab", click: () => fireAndForget(() => sendBlockToTab(blockId, null)) });
-    return [
-        { label: "Send to Tab", type: "submenu", submenu: tabItems },
-        { label: "Send to New Window", click: () => fireAndForget(() => sendBlockToNewWindow(blockId)) },
-    ];
+    const items: ContextMenuItem[] = [{ label: "Send to Tab", type: "submenu", submenu: tabItems }];
+
+    let otherWindows: OtherWindow[] = [];
+    try {
+        otherWindows = await loadOtherWindows();
+    } catch (e) {
+        console.log("send to window: couldn't list windows", e);
+    }
+    if (otherWindows.length > 0) {
+        items.push({
+            label: "Send to Window",
+            type: "submenu",
+            submenu: otherWindows.map((w) => ({
+                label: w.label,
+                type: "submenu",
+                submenu: [
+                    ...w.tabs.map((t) => ({
+                        label: t.name,
+                        click: () => fireAndForget(() => sendBlockToTab(blockId, t.id, w.workspaceId)),
+                    })),
+                    { type: "separator" },
+                    {
+                        label: "New Tab",
+                        click: () => fireAndForget(() => sendBlockToTab(blockId, null, w.workspaceId)),
+                    },
+                ] as ContextMenuItem[],
+            })),
+        });
+    }
+    items.push({ label: "Send to New Window", click: () => fireAndForget(() => sendBlockToNewWindow(blockId)) });
+    return items;
 }
