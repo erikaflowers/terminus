@@ -5,16 +5,17 @@ Fork of [WaveTerm](https://github.com/wavetermdev/waveterm) for internal tool us
 ## Build
 
 ### Prerequisites
-- Go, Node.js 22+, Zig, Task (`brew install go-task go zig`)
+- Go, Node.js 22+, Task (`brew install go-task go`); Zig only for Linux/Windows cross-compiles. The Mac Mini is the build hub.
 
 ### Commands
 ```bash
-task init              # npm install + go mod tidy (first time)
-task dev               # Dev mode with HMR
-task build:backend     # Compile Go server + wsh
-task package           # Production build → make/
-task electron:quickdev # Fast arm64 macOS dev (skips docs, wsh, generate)
+npm ci                 # deps (don't let npm rewrite the lockfile)
+task dev               # Dev mode with HMR (quit the installed Terminus first: shared lock)
+task build:backend --force && npm run build:prod && rm -rf make/ && \
+  CSC_IDENTITY_AUTO_DISCOVERY=false npm exec electron-builder -- -c electron-builder.config.cjs -p never
+task generate          # after changing Go service methods / meta keys
 ```
+**Never `task package`** (race condition ships an app with no window). See BUILD.md for releases (`terminus-v*` tags).
 
 ### Logs
 - Frontend: Chrome DevTools (Cmd+Option+I)
@@ -71,7 +72,14 @@ Go Backend (wavesrv — SQLite, SSH, terminal emulation)
 | `pkg/wconfig/` | Config management with file watchers |
 | `schema/` | JSON schemas for settings, AI presets, widgets |
 
-## Sprint Info
+## Conventions (since 0.14.2)
 
-Working on: Initial fork setup and rename
-Branch: main
+- **Shell strings:** every value interpolated into a shell command goes through `frontend/util/shellquote.ts` (`shellQuote`, `shellJoin`, `sshCommand`); tmux session names must pass `isSafeSessionName`. `getApi().execCommand` is `/bin/sh -c` with a 10 s timeout.
+- **Never delete a block to move it.** Use the `detach` layout action (`wcore.MoveBlockToTab`); `delete`/`closeNode` calls `DeleteBlock`, which kills the process.
+- **Terminus launched from Finder has no `LANG`:** tmux (and others) mangle control characters in output. Use printable separators when parsing command output.
+- **tmux attach:** use `new-session -A` (attach-or-create) with `exec`, so a dead session leaves the pane "done" and Enter re-attaches.
+- Fork meta keys live in `pkg/waveobj/wtypemeta.go` (`agent:*`, `session:*`, `frame:collapsed`/`prevsize`, `term:bgcolor`); run `task generate` after adding one.
+
+## Status
+
+Current release **0.14.3** (`terminus-v0.14.3`, 2026-09-27). Stable; on hold. What's next: ROADMAP.md → "Next". Code review and remaining lows: `docs/REVIEW-2026-09-26.md`.

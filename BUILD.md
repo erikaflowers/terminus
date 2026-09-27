@@ -55,21 +55,31 @@ Compiles the React frontend with Vite in production mode.
 
 ```bash
 rm -rf make/
-npm exec electron-builder -- -c electron-builder.config.cjs -p never
+CSC_IDENTITY_AUTO_DISCOVERY=false npm exec electron-builder -- -c electron-builder.config.cjs -p never
 ```
+
+`CSC_IDENTITY_AUTO_DISCOVERY=false` skips the code-signing certificate lookup (builds are ad-hoc signed and not notarized, so a first launch on another Mac may need right-click → Open). For a quick Apple Silicon preview only: add `--mac zip --arm64`.
 
 Generates DMGs and zip archives for both ARM64 and x64:
 
 ```
-make/Terminus-darwin-arm64-0.14.1.dmg
-make/Terminus-darwin-x64-0.14.1.dmg
-make/Terminus-darwin-arm64-0.14.1.zip
-make/Terminus-darwin-x64-0.14.1.zip
+make/Terminus-darwin-arm64-<version>.dmg
+make/Terminus-darwin-x64-<version>.dmg
+make/Terminus-darwin-arm64-<version>.zip
+make/Terminus-darwin-x64-<version>.zip
 ```
 
 ### Important: Do NOT use `task package`
 
 `task package` has a race condition where `clean` deletes `dist/`, then `build:backend` thinks wavesrv is up-to-date and skips it. The result is a broken app that launches but shows no window. Always use the three-step process above.
+
+## Build hub, versions and releases
+
+- The Mac Mini is the build hub (Go, go-task, Zig, Node 24 via fnm; see the Matilda stack doctrine).
+- **npm 11 skips dependency install scripts.** Electron still works (`postinstall.cjs` sets up `Terminus.app`). `sharp` doesn't load, so `vite-plugin-image-optimizer` skips logo optimization (harmless; upstream declares sharp properly in #3524).
+- **Release:** bump `version` in `package.json` and the two root entries in `package-lock.json`, PR to `main`, merge, then tag **`terminus-v<version>`**. Plain `v0.14.x` tags belong to upstream Wave and are also in this repo.
+- **Checks before a release:** `npx vitest run` (one existing failure: `layoutTree › compute move`), `go build ./... && go vet ./pkg/...`, `go test ./pkg/wcore/`, and `npx tsc --noEmit -p tsconfig.json` (5 existing errors).
+- **Regenerate TS bindings** after changing Go service methods or meta keys: `task generate` (writes `frontend/app/store/services.ts`, `frontend/types/gotypes.d.ts`, `pkg/*/metaconsts.go`).
 
 ## Debugging
 
