@@ -7,7 +7,7 @@
     "productName": "Terminus",
     "description": "AI-Native Terminal Multiplexer — Forked from WaveTerm",
     "license": "Apache-2.0",
-    "version": "0.14.1",
+    "version": "0.14.2",
     "homepage": "",
     "build": {
         "appId": "dev.matilda.terminus"
