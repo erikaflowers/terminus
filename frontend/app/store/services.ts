@@ -119,6 +119,12 @@ class WindowServiceType {
         return WOS.callBackendService("window", "MoveBlockToNewWindow", Array.from(arguments))
     }
 
+    // open a workspace snapshot (Clone Workspace, from this or another machine) as a new window
+    // @returns object updates
+    OpenWorkspaceSnapshot(snapshotJson: string): Promise<void> {
+        return WOS.callBackendService("window", "OpenWorkspaceSnapshot", Array.from(arguments))
+    }
+
     // set window position and size
     // @returns object updates
     SetWindowPosAndSize(windowId: string, pos: Point, size: WinSize): Promise<void> {

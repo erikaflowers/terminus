@@ -52,6 +52,17 @@ function initGlobal(initOpts: GlobalInitOptions) {
     setPlatform(initOpts.platform);
     initGlobalAtoms(initOpts);
     try {
+        // Clone Workspace: a snapshot arrived in this machine's workspace-inbox
+        getApi().onWorkspaceSnapshot((msg) => {
+            fireAndForget(async () => {
+                const { promptOpenWorkspaceSnapshot } = await import("@/app/workspace/workspaceclone");
+                promptOpenWorkspaceSnapshot(msg.snapshot, msg.file);
+            });
+        });
+    } catch (e) {
+        console.log("failed to initialize onWorkspaceSnapshot handler", e);
+    }
+    try {
         getApi().onMenuItemAbout(() => {
             modalsModel.pushModal("AboutModal");
         });

@@ -82,6 +82,56 @@ func (ws *WindowService) SetWindowPosAndSize(ctx context.Context, windowId strin
 	return waveobj.ContextGetUpdatesRtn(ctx), nil
 }
 
+func (svc *WindowService) OpenWorkspaceSnapshot_Meta() tsgenmeta.MethodMeta {
+	return tsgenmeta.MethodMeta{
+		Desc:     "open a workspace snapshot (Clone Workspace, from this or another machine) as a new window",
+		ArgNames: []string{"ctx", "snapshotJson"},
+	}
+}
+
+func (svc *WindowService) OpenWorkspaceSnapshot(ctx context.Context, snapshotJson string) (waveobj.UpdatesRtnType, error) {
+	snap, err := wcore.ParseWorkspaceSnapshot([]byte(snapshotJson))
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("OpenWorkspaceSnapshot from %q: %d tab(s)", snap.From, len(snap.Tabs))
+	ctx = waveobj.ContextWithUpdates(ctx)
+	ws, err := wcore.CreateWorkspaceWithEmptyTab(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error creating workspace: %w", err)
+	}
+	newWindow, err := wcore.CreateWindow(ctx, nil, ws.OID)
+	if err != nil {
+		return nil, fmt.Errorf("error creating window: %w", err)
+	}
+	ws, err = wcore.GetWorkspace(ctx, ws.OID)
+	if err != nil {
+		return nil, fmt.Errorf("error getting workspace: %w", err)
+	}
+	for i, st := range snap.Tabs {
+		tabId := ws.ActiveTabId
+		if i > 0 {
+			tabId, err = wcore.CreateEmptyTab(ctx, ws.OID, false)
+			if err != nil {
+				return nil, fmt.Errorf("error creating tab: %w", err)
+			}
+		}
+		if err := wcore.ImportSnapshotTab(ctx, tabId, st); err != nil {
+			return nil, err
+		}
+	}
+	updates := waveobj.ContextGetUpdatesRtn(ctx)
+	wps.Broker.SendUpdateEvents(updates)
+	eventbus.SendEventToElectron(eventbus.WSEventType{
+		EventType: eventbus.WSEvent_ElectronNewWindow,
+		Data:      newWindow.OID,
+	})
+	if !eventbus.BusyWaitForWindowId(newWindow.OID, 2*time.Second) {
+		return nil, fmt.Errorf("new window not created")
+	}
+	return updates, nil
+}
+
 func (svc *WindowService) MoveBlockToNewWindow_Meta() tsgenmeta.MethodMeta {
 	return tsgenmeta.MethodMeta{
 		Desc:     "move block to new window",
