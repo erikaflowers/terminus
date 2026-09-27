@@ -13,6 +13,7 @@ import {
 import { CollapseSibling, computeCollapse, computeCollapsedFraction, computeExpand } from "@/app/block/collapsemath";
 import { ColorPickerPopover } from "@/app/block/colorpicker";
 import { DurableSessionFlyover } from "@/app/block/durable-session-flyover";
+import { SessionButton } from "@/app/block/sessionbutton";
 import { TmuxDetachButton } from "@/app/block/tmuxdetach";
 import { setAgentPref } from "@/app/store/agents";
 import { ContextMenuModel } from "@/app/store/contextmenu";
@@ -361,6 +362,13 @@ const BlockFrame_Header = ({
                     currentColor={currentBgColor}
                     onColorChange={handleBgColorChange}
                     onReset={handleBgColorReset}
+                />
+            )}
+            {isTerminalBlock && (
+                <SessionButton
+                    blockId={nodeModel.blockId}
+                    savedHost={blockData?.meta?.["session:host"]}
+                    savedSession={blockData?.meta?.["session:tmux"]}
                 />
             )}
             {isTerminalBlock && (

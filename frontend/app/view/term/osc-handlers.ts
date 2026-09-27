@@ -1,6 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import { noteShellCommand } from "@/app/block/sessionrestore";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
 import {
@@ -28,7 +29,7 @@ export type ShellIntegrationStatus = "ready" | "running-command";
 
 type Osc16162Command =
     | { command: "A"; data: Record<string, never> }
-    | { command: "C"; data: { cmd64?: string } }
+    | { command: "C"; data: { cmd64?: string; cmdx64?: string } }
     | {
           command: "M";
           data: {
@@ -82,7 +83,7 @@ function checkCommandForTelemetry(decodedCmd: string) {
 function handleShellIntegrationCommandStart(
     termWrap: TermWrap,
     blockId: string,
-    cmd: { command: "C"; data: { cmd64?: string } },
+    cmd: { command: "C"; data: { cmd64?: string; cmdx64?: string } },
     rtInfo: ObjRTInfo // this is passed by reference and modified inside of this function
 ): void {
     rtInfo["shell:state"] = "running-command";
@@ -103,6 +104,12 @@ function handleShellIntegrationCommandStart(
                 rtInfo["shell:lastcmd"] = decodedCmd;
                 globalStore.set(termWrap.lastCommandAtom, decodedCmd);
                 checkCommandForTelemetry(decodedCmd);
+                // Session Restore: notice "ssh host …" (cmdx64 = the line with aliases like `macstudio` expanded)
+                let expandedCmd: string = null;
+                try {
+                    expandedCmd = cmd.data.cmdx64 ? base64ToString(cmd.data.cmdx64) : null;
+                } catch (_) {}
+                noteShellCommand(blockId, decodedCmd, expandedCmd);
             } catch (e) {
                 console.error("Error decoding cmd64:", e);
                 rtInfo["shell:lastcmd"] = null;

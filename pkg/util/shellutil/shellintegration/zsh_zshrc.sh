@@ -103,7 +103,14 @@ _waveterm_si_preexec() {
   fi
   local cmd64
   cmd64=$(printf '%s' "$cmd" | base64 2>/dev/null | tr -d '\n\r')
-  if [ -n "$cmd64" ]; then
+  # $2 is the command with aliases expanded (e.g. "macstudio" -> "ssh user@host"); send it when it differs
+  local cmdx="$2" cmdx64=""
+  if [[ "$cmdx" != "$cmd" && ${#cmdx} -le 8192 ]]; then
+    cmdx64=$(printf '%s' "$cmdx" | base64 2>/dev/null | tr -d '\n\r')
+  fi
+  if [ -n "$cmd64" ] && [ -n "$cmdx64" ]; then
+    printf '\033]16162;C;{"cmd64":"%s","cmdx64":"%s"}\007' "$cmd64" "$cmdx64"
+  elif [ -n "$cmd64" ]; then
     printf '\033]16162;C;{"cmd64":"%s"}\007' "$cmd64"
   else
     printf '\033]16162;C\007'

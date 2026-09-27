@@ -1144,6 +1144,9 @@ declare global {
         "agent:name"?: string;
         "agent:color"?: string;
         "agent:role"?: string;
+        "session:*"?: boolean;
+        "session:host"?: string;
+        "session:tmux"?: string;
         "web:zoom"?: number;
         "web:hidenav"?: boolean;
         "web:partition"?: string;

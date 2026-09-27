@@ -149,6 +149,10 @@ const (
 	MetaKey_AgentColor                       = "agent:color"
 	MetaKey_AgentRole                        = "agent:role"
 
+	MetaKey_SessionClear                     = "session:*"
+	MetaKey_SessionHost                      = "session:host"
+	MetaKey_SessionTmux                      = "session:tmux"
+
 	MetaKey_WebZoom                          = "web:zoom"
 	MetaKey_WebHideNav                       = "web:hidenav"
 	MetaKey_WebPartition                     = "web:partition"

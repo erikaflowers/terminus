@@ -19,9 +19,10 @@ export function shellJoin(args: string[]): string {
  * the result to the remote shell, so the remote command must itself be one quoted word locally.
  * `remoteArgs` are quoted for the remote shell, then the whole string is quoted again for the local one.
  */
-export function sshCommand(host: string, remoteArgs: string[], opts?: { tty?: boolean }): string {
+export function sshCommand(host: string, remoteArgs: string[], opts?: { tty?: boolean; sshOpts?: string[] }): string {
     const remote = shellJoin(remoteArgs);
-    return ["ssh", ...(opts?.tty ? ["-t"] : []), shellQuote(host), shellQuote(remote)].join(" ");
+    const flags = [...(opts?.tty ? ["-t"] : []), ...(opts?.sshOpts ?? []).map(shellQuote)];
+    return ["ssh", ...flags, shellQuote(host), shellQuote(remote)].join(" ");
 }
 
 /** tmux session / agent names we accept: letters, digits, _ . - (what tmux itself is happy with). */
