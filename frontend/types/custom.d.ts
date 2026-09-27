@@ -104,6 +104,8 @@ declare global {
         getUpdaterChannel: () => string; // get-updater-channel
         installAppUpdate: () => void; // install-app-update
         onMenuItemAbout: (callback: () => void) => void; // menu-item-about
+        onWorkspaceSnapshot: (callback: (msg: { file: string; snapshot: any }) => void) => void; // workspace-snapshot (Clone Workspace inbox)
+        workspaceSnapshotDone: (file: string, accepted: boolean) => void; // workspace-snapshot-done
         updateWindowControlsOverlay: (rect: Dimensions) => void; // update-window-controls-overlay
         onReinjectKey: (callback: (waveEvent: WaveKeyboardEvent) => void) => void; // reinject-key
         setWebviewFocus: (focusedId: number) => void; // webview-focus, focusedId is the getWebContentsId of the webview

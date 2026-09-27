@@ -273,6 +273,47 @@ function buildTabContextMenu(
     return menu;
 }
 
+// "Clone Workspace to ▸ [your other Macs]", "Copy Workspace Snapshot", "Open Workspace from Clipboard"
+async function buildCloneWorkspaceMenu(): Promise<ContextMenuItem[]> {
+    const clone = await import("@/app/workspace/workspaceclone");
+    let targets: { label: string; target: string }[] = [];
+    try {
+        targets = await clone.listCloneTargets();
+    } catch (e) {
+        console.log("clone workspace: couldn't list machines", e);
+    }
+    const send = (t: { label: string; target: string }) =>
+        fireAndForget(async () => {
+            try {
+                await clone.sendWorkspaceTo(t.target);
+                clone.showMessage(`Workspace sent to ${t.label}. Terminus there will offer to open it.`);
+            } catch (e) {
+                clone.showMessage(`Couldn't send to ${t.label}: ${e?.message ?? e}`);
+            }
+        });
+    const cloneSubmenu: ContextMenuItem[] =
+        targets.length > 0
+            ? targets.map((t) => ({ label: t.label, click: () => send(t) }))
+            : [{ label: "No other Macs online (Tailscale)", enabled: false }];
+    return [
+        { label: "Clone Workspace to", type: "submenu", submenu: cloneSubmenu },
+        { label: "Copy Workspace Snapshot", click: () => fireAndForget(() => clone.copyWorkspaceSnapshot()) },
+        {
+            label: "Open Workspace from Clipboard",
+            click: () =>
+                fireAndForget(async () => {
+                    const snap = await clone.readWorkspaceSnapshotFromClipboard();
+                    if (snap) {
+                        clone.promptOpenWorkspaceSnapshot(snap);
+                    } else {
+                        clone.showMessage("The clipboard doesn't hold a Terminus workspace snapshot.");
+                    }
+                }),
+        },
+        { type: "separator" },
+    ];
+}
+
 interface TabProps {
     id: string;
     active: boolean;
@@ -313,8 +354,14 @@ const TabInner = forwardRef<HTMLDivElement, TabProps>((props, ref) => {
     const handleContextMenu = useCallback(
         (e: React.MouseEvent<HTMLDivElement, MouseEvent>) => {
             e.preventDefault();
-            const menu = buildTabContextMenu(id, renameRef, onClose);
-            ContextMenuModel.getInstance().showContextMenu(menu, e);
+            e.persist?.();
+            fireAndForget(async () => {
+                const cloneItems = await buildCloneWorkspaceMenu();
+                const menu = buildTabContextMenu(id, renameRef, onClose);
+                const closeIdx = menu.findIndex((m) => m.label === "Close Tab");
+                menu.splice(closeIdx < 0 ? menu.length : closeIdx, 0, ...cloneItems);
+                ContextMenuModel.getInstance().showContextMenu(menu, e);
+            });
         },
         [id, onClose]
     );
