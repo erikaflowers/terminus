@@ -126,9 +126,9 @@ func (svc *WindowService) OpenWorkspaceSnapshot(ctx context.Context, snapshotJso
 		EventType: eventbus.WSEvent_ElectronNewWindow,
 		Data:      newWindow.OID,
 	})
-	if !eventbus.BusyWaitForWindowId(newWindow.OID, 2*time.Second) {
-		return nil, fmt.Errorf("new window not created")
-	}
+	// No wait for the window to connect: it loads its (already complete) workspace from the DB.
+	// (eventbus.BusyWaitForWindowId matched websockets by window id, but they register as
+	// "tab:<id>", so it always timed out and reported an error after the window had opened.)
 	return updates, nil
 }
 
@@ -166,10 +166,9 @@ func (svc *WindowService) MoveBlockToNewWindow(ctx context.Context, currentTabId
 		EventType: eventbus.WSEvent_ElectronNewWindow,
 		Data:      newWindow.OID,
 	})
-	windowCreated := eventbus.BusyWaitForWindowId(newWindow.OID, 2*time.Second)
-	if !windowCreated {
-		return nil, fmt.Errorf("new window not created")
-	}
+	// No wait for the window to connect: it loads its (already complete) workspace from the DB.
+	// (eventbus.BusyWaitForWindowId matched websockets by window id, but they register as
+	// "tab:<id>", so it always timed out and reported an error after the window had opened.)
 	return updates, nil
 }
 
