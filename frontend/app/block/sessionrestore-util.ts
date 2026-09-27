@@ -118,20 +118,28 @@ export function buildSessionRestoreScript(host: string, session: string): string
     return `exec ${sshCommand(host, remote, { tty: true })}\n`;
 }
 
-/** Command listing tmux sessions on `host` as "name<TAB>attachedCount" lines (no prompts, short timeout). */
+/**
+ * Command listing tmux sessions on `host` as "name|attachedCount" lines (no prompts, short timeout).
+ * The separator must be printable: without a UTF-8 locale (Terminus launched from Finder has no LANG)
+ * tmux replaces control characters like TAB with "_", which turned "siddig<TAB>1" into "siddig_1".
+ */
 export function buildListSessionsCommand(host: string): string {
     const remote = [
         "sh",
         "-c",
-        `PATH="$PATH:${RemotePath}"; tmux ls -F '#{session_name}\t#{session_attached}' 2>/dev/null`,
+        `PATH="$PATH:${RemotePath}"; tmux ls -F '#{session_name}|#{session_attached}' 2>/dev/null`,
     ];
     return sshCommand(host, remote, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
 }
 
 export function parseSessionList(stdout: string): { name: string; attached: number }[] {
-    return (stdout ?? "")
-        .split("\n")
-        .map((l) => l.split("\t"))
-        .filter(([name]) => isSafeSessionName(name))
-        .map(([name, att]) => ({ name, attached: parseInt(att, 10) || 0 }));
+    const rtn: { name: string; attached: number }[] = [];
+    for (const line of (stdout ?? "").split("\n")) {
+        // strict: anything that isn't exactly "name|count" is ignored rather than guessed at
+        const m = line.trim().match(/^([A-Za-z0-9_.-]+)\|(\d+)$/);
+        if (m && isSafeSessionName(m[1])) {
+            rtn.push({ name: m[1], attached: parseInt(m[2], 10) });
+        }
+    }
+    return rtn;
 }

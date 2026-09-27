@@ -1,4 +1,4 @@
-import { execFileSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import { mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -9,6 +9,15 @@ import {
     parseSessionList,
     parseSshCommand,
 } from "./sessionrestore-util";
+
+function hasTmux(): boolean {
+    try {
+        execSync("tmux -V", { env: { PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" }, stdio: "ignore" });
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 describe("parseSshCommand", () => {
     it("finds the host, skipping options and their values", () => {
@@ -63,10 +72,32 @@ describe("buildSessionRestoreScript", () => {
         expect(cmd).toContain("'BatchMode=yes'");
         expect(cmd).toContain("'ConnectTimeout=5'");
     });
-    it("parses tmux ls output", () => {
-        expect(parseSessionList("lee\t1\nrenner\t0\nbad name\t1\n\n")).toEqual([
+    it("parses tmux ls output strictly", () => {
+        expect(parseSessionList("lee|1\nrenner|0\nbad name|1\nsiddig_1\n\n")).toEqual([
             { name: "lee", attached: 1 },
             { name: "renner", attached: 0 },
         ]);
+    });
+    // Regression: Terminus launched from Finder has no LANG; tmux then replaced the old TAB separator
+    // with "_" and "siddig<TAB>1" was saved as a session named "siddig_1". Run real tmux without a locale.
+    it.skipIf(!hasTmux())("reads session names correctly from real tmux with no locale", () => {
+        const sock = "srtest-" + process.pid;
+        const env = { PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", HOME: process.env.HOME };
+        const tmux = (args: string) => execSync(`tmux -L ${sock} ${args}`, { env, encoding: "utf8" });
+        try {
+            tmux("new-session -d -s siddig");
+            tmux("new-session -d -s lee_2");
+            // the exact format the list command uses (minus ssh)
+            const out = tmux(`ls -F '#{session_name}|#{session_attached}'`);
+            expect(parseSessionList(out)).toEqual([
+                { name: "lee_2", attached: 0 },
+                { name: "siddig", attached: 0 },
+            ]);
+            expect(buildListSessionsCommand("h")).toContain("#{session_name}|#{session_attached}");
+        } finally {
+            try {
+                tmux("kill-server");
+            } catch {}
+        }
     });
 });
