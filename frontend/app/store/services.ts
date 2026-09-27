@@ -171,6 +171,12 @@ class WorkspaceServiceType {
         return WOS.callBackendService("workspace", "ListWorkspaces", Array.from(arguments))
     }
 
+    // move a block to another tab (empty dstTabId = a new tab in the source tab's workspace); the block's process keeps running
+    // @returns dstTabId (and object updates)
+    MoveBlockToTab(srcTabId: string, blockId: string, dstTabId: string): Promise<string> {
+        return WOS.callBackendService("workspace", "MoveBlockToTab", Array.from(arguments))
+    }
+
     // @returns object updates
     SetActiveTab(workspaceId: string, tabId: string): Promise<void> {
         return WOS.callBackendService("workspace", "SetActiveTab", Array.from(arguments))

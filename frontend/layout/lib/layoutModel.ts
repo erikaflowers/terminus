@@ -572,6 +572,29 @@ export class LayoutModel {
                 await this.cleanupOrphanedBlocks();
                 break;
             }
+            case "detach": {
+                // The block moved to another tab or window. Drop its node from this layout WITHOUT
+                // onNodeDelete: deleting the block would kill its process (shell, ssh, tmux…).
+                const ephemeral = this.getter(this.ephemeralNode);
+                if (ephemeral?.data?.blockId === action.blockid) {
+                    this.setter(this.ephemeralNode, undefined);
+                    this.treeState.focusedNodeId = undefined;
+                    break;
+                }
+                const leaf = this.getNodeByBlockId(action.blockid);
+                if (!leaf) {
+                    break;
+                }
+                if (leaf.id === this.magnifiedNodeId) {
+                    this.magnifyNodeToggle(leaf.id);
+                }
+                const detachAction: LayoutTreeDeleteNodeAction = {
+                    type: LayoutTreeActionType.DeleteNode,
+                    nodeId: leaf.id,
+                };
+                this.treeReducer(detachAction, false);
+                break;
+            }
             default:
                 console.warn("unsupported layout action", action);
                 break;
@@ -828,9 +851,8 @@ export class LayoutModel {
             return resizeAction?.resizeOperations.find((op) => op.nodeId === node.id)?.size ?? node.size;
         }
 
-        const additionalProps: LayoutNodeAdditionalProps = node.id in additionalPropsMap
-            ? additionalPropsMap[node.id]
-            : { treeKey: "0" };
+        const additionalProps: LayoutNodeAdditionalProps =
+            node.id in additionalPropsMap ? additionalPropsMap[node.id] : { treeKey: "0" };
 
         const nodeRect: Dimensions = node.id === this.treeState.rootNode.id ? boundingRect : additionalProps.rect;
         const nodeIsRow = node.flexDirection === FlexDirection.Row;

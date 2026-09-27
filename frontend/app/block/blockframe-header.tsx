@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { AgentButton } from "@/app/block/agentbutton";
+import { getSendBlockMenuItems } from "@/app/block/blockmove";
 import {
     blockViewToIcon,
     blockViewToName,
@@ -47,6 +48,8 @@ function handleHeaderContextMenu(
                 nodeModel.toggleMagnify();
             },
         },
+        { type: "separator" },
+        ...getSendBlockMenuItems(blockId),
         { type: "separator" },
         {
             label: "Copy BlockId",

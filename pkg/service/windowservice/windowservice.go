@@ -92,33 +92,26 @@ func (svc *WindowService) MoveBlockToNewWindow_Meta() tsgenmeta.MethodMeta {
 func (svc *WindowService) MoveBlockToNewWindow(ctx context.Context, currentTabId string, blockId string) (waveobj.UpdatesRtnType, error) {
 	log.Printf("MoveBlockToNewWindow(%s, %s)", currentTabId, blockId)
 	ctx = waveobj.ContextWithUpdates(ctx)
-	tab, err := wstore.DBMustGet[*waveobj.Tab](ctx, currentTabId)
+	// the new window's tab starts empty so no fresh shell is spawned next to the moved block
+	ws, err := wcore.CreateWorkspaceWithEmptyTab(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("error getting tab: %w", err)
+		return nil, fmt.Errorf("error creating workspace: %w", err)
 	}
-	log.Printf("tab.BlockIds[%s]: %v", tab.OID, tab.BlockIds)
-	var foundBlock bool
-	for _, tabBlockId := range tab.BlockIds {
-		if tabBlockId == blockId {
-			foundBlock = true
-			break
-		}
-	}
-	if !foundBlock {
-		return nil, fmt.Errorf("block not found in current tab")
-	}
-	newWindow, err := wcore.CreateWindow(ctx, nil, "")
+	newWindow, err := wcore.CreateWindow(ctx, nil, ws.OID)
 	if err != nil {
 		return nil, fmt.Errorf("error creating window: %w", err)
 	}
-	ws, err := wcore.GetWorkspace(ctx, newWindow.WorkspaceId)
+	ws, err = wcore.GetWorkspace(ctx, ws.OID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting workspace: %w", err)
 	}
-	err = wstore.MoveBlockToTab(ctx, currentTabId, ws.ActiveTabId, blockId)
+	// move before the window opens, so its tab loads with the insert already queued
+	err = wcore.MoveBlockToTab(ctx, currentTabId, ws.ActiveTabId, blockId)
 	if err != nil {
 		return nil, fmt.Errorf("error moving block to tab: %w", err)
 	}
+	updates := waveobj.ContextGetUpdatesRtn(ctx)
+	wps.Broker.SendUpdateEvents(updates)
 	eventbus.SendEventToElectron(eventbus.WSEventType{
 		EventType: eventbus.WSEvent_ElectronNewWindow,
 		Data:      newWindow.OID,
@@ -127,16 +120,7 @@ func (svc *WindowService) MoveBlockToNewWindow(ctx context.Context, currentTabId
 	if !windowCreated {
 		return nil, fmt.Errorf("new window not created")
 	}
-	wcore.QueueLayoutActionForTab(ctx, currentTabId, waveobj.LayoutActionData{
-		ActionType: wcore.LayoutActionDataType_Remove,
-		BlockId:    blockId,
-	})
-	wcore.QueueLayoutActionForTab(ctx, ws.ActiveTabId, waveobj.LayoutActionData{
-		ActionType: wcore.LayoutActionDataType_Insert,
-		BlockId:    blockId,
-		Focused:    true,
-	})
-	return waveobj.ContextGetUpdatesRtn(ctx), nil
+	return updates, nil
 }
 
 func (svc *WindowService) SwitchWorkspace_Meta() tsgenmeta.MethodMeta {

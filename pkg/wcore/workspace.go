@@ -51,6 +51,21 @@ var WorkspaceIcons = [...]string{
 }
 
 func CreateWorkspace(ctx context.Context, name string, icon string, color string, applyDefaults bool, isInitialLaunch bool) (*waveobj.Workspace, error) {
+	return createWorkspace(ctx, name, icon, color, applyDefaults, func(wsId string) error {
+		_, err := CreateTab(ctx, wsId, "", true, isInitialLaunch)
+		return err
+	})
+}
+
+// CreateWorkspaceWithEmptyTab creates a workspace whose only tab has no blocks (see CreateEmptyTab).
+func CreateWorkspaceWithEmptyTab(ctx context.Context) (*waveobj.Workspace, error) {
+	return createWorkspace(ctx, "", "", "", false, func(wsId string) error {
+		_, err := CreateEmptyTab(ctx, wsId, true)
+		return err
+	})
+}
+
+func createWorkspace(ctx context.Context, name string, icon string, color string, applyDefaults bool, createFirstTab func(wsId string) error) (*waveobj.Workspace, error) {
 	ws := &waveobj.Workspace{
 		OID:    uuid.NewString(),
 		TabIds: []string{},
@@ -62,7 +77,7 @@ func CreateWorkspace(ctx context.Context, name string, icon string, color string
 	if err != nil {
 		return nil, fmt.Errorf("error inserting workspace: %w", err)
 	}
-	_, err = CreateTab(ctx, ws.OID, "", true, isInitialLaunch)
+	err = createFirstTab(ws.OID)
 	if err != nil {
 		return nil, fmt.Errorf("error creating tab: %w", err)
 	}
@@ -223,6 +238,17 @@ func getNextTabName(tabNames []string) string {
 
 // returns tabid
 func CreateTab(ctx context.Context, workspaceId string, tabName string, activateTab bool, isInitialLaunch bool) (string, error) {
+	// No need to apply an initial layout for the initial launch, since the starter layout will get applied after onboarding modal dismissal
+	return createTab(ctx, workspaceId, tabName, activateTab, !isInitialLaunch, !isInitialLaunch)
+}
+
+// CreateEmptyTab creates a tab with no blocks (tab presets still apply). It is the destination
+// when an existing block is moved into a new tab or window, so no fresh shell gets spawned.
+func CreateEmptyTab(ctx context.Context, workspaceId string, activateTab bool) (string, error) {
+	return createTab(ctx, workspaceId, "", activateTab, false, true)
+}
+
+func createTab(ctx context.Context, workspaceId string, tabName string, activateTab bool, applyLayout bool, applyPresets bool) (string, error) {
 	if tabName == "" {
 		ws, err := GetWorkspace(ctx, workspaceId)
 		if err != nil {
@@ -250,12 +276,13 @@ func CreateTab(ctx context.Context, workspaceId string, tabName string, activate
 		}
 	}
 
-	// No need to apply an initial layout for the initial launch, since the starter layout will get applied after onboarding modal dismissal
-	if !isInitialLaunch {
+	if applyLayout {
 		err = ApplyPortableLayout(ctx, tab.OID, GetNewTabLayout(), true)
 		if err != nil {
 			return tab.OID, fmt.Errorf("error applying new tab layout: %w", err)
 		}
+	}
+	if applyPresets {
 		presetMeta, presetErr := getTabPresetMeta()
 		if presetErr != nil {
 			log.Printf("error getting tab preset meta: %v\n", presetErr)

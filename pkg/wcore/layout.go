@@ -23,6 +23,7 @@ const (
 	LayoutActionDataType_SplitHorizontal = "splithorizontal"
 	LayoutActionDataType_SplitVertical   = "splitvertical"
 	LayoutActionDataType_CleanupOrphaned = "cleanuporphaned"
+	LayoutActionDataType_Detach          = "detach" // remove the node from the layout without deleting the block (it moved to another tab)
 )
 
 type PortableLayout []struct {

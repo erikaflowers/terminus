@@ -165,6 +165,42 @@ func (svc *WorkspaceService) CreateTab(workspaceId string, tabName string, activ
 	return tabId, updates, nil
 }
 
+func (svc *WorkspaceService) MoveBlockToTab_Meta() tsgenmeta.MethodMeta {
+	return tsgenmeta.MethodMeta{
+		Desc:       "move a block to another tab (empty dstTabId = a new tab in the source tab's workspace); the block's process keeps running",
+		ArgNames:   []string{"srcTabId", "blockId", "dstTabId"},
+		ReturnDesc: "dstTabId",
+	}
+}
+
+func (svc *WorkspaceService) MoveBlockToTab(srcTabId string, blockId string, dstTabId string) (string, waveobj.UpdatesRtnType, error) {
+	ctx, cancelFn := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancelFn()
+	ctx = waveobj.ContextWithUpdates(ctx)
+	if dstTabId == "" {
+		wsId, err := wstore.DBFindWorkspaceForTabId(ctx, srcTabId)
+		if err != nil {
+			return "", nil, fmt.Errorf("error finding workspace for tab: %w", err)
+		}
+		dstTabId, err = wcore.CreateEmptyTab(ctx, wsId, false)
+		if err != nil {
+			return "", nil, fmt.Errorf("error creating tab: %w", err)
+		}
+	}
+	err := wcore.MoveBlockToTab(ctx, srcTabId, dstTabId, blockId)
+	if err != nil {
+		return "", nil, fmt.Errorf("error moving block: %w", err)
+	}
+	updates := waveobj.ContextGetUpdatesRtn(ctx)
+	go func() {
+		defer func() {
+			panichandler.PanicHandler("WorkspaceService:MoveBlockToTab:SendUpdateEvents", recover())
+		}()
+		wps.Broker.SendUpdateEvents(updates)
+	}()
+	return dstTabId, updates, nil
+}
+
 func (svc *WorkspaceService) UpdateTabIds_Meta() tsgenmeta.MethodMeta {
 	return tsgenmeta.MethodMeta{
 		ArgNames: []string{"uiContext", "workspaceId", "tabIds"},
