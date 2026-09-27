@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { AgentButton } from "@/app/block/agentbutton";
+import { getSendBlockMenuItems } from "@/app/block/blockmove";
 import {
     blockViewToIcon,
     blockViewToName,
@@ -9,10 +10,12 @@ import {
     OptMagnifyButton,
     renderHeaderElements,
 } from "@/app/block/blockutil";
+import { CollapseSibling, computeCollapse, computeCollapsedFraction, computeExpand } from "@/app/block/collapsemath";
 import { ColorPickerPopover } from "@/app/block/colorpicker";
+import { DurableSessionFlyover } from "@/app/block/durable-session-flyover";
+import { SessionButton } from "@/app/block/sessionbutton";
 import { TmuxDetachButton } from "@/app/block/tmuxdetach";
 import { setAgentPref } from "@/app/store/agents";
-import { DurableSessionFlyover } from "@/app/block/durable-session-flyover";
 import { ContextMenuModel } from "@/app/store/contextmenu";
 import { atoms, recordTEvent, refocusNode, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
@@ -20,9 +23,9 @@ import { uxCloseBlock } from "@/app/store/keymodel";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
 import { IconButton } from "@/element/iconbutton";
-import { getLayoutModelForStaticTab, LayoutTreeActionType, NodeModel } from "@/layout/index";
 import type { LayoutTreeResizeNodeAction } from "@/layout/index";
-import { findNode, findParent } from "@/layout/lib/layoutNode";
+import { getLayoutModelForStaticTab, LayoutTreeActionType, NodeModel } from "@/layout/index";
+import { findParent } from "@/layout/lib/layoutNode";
 import { FlexDirection } from "@/layout/lib/types";
 import * as util from "@/util/util";
 import { cn } from "@/util/util";
@@ -30,7 +33,7 @@ import * as jotai from "jotai";
 import * as React from "react";
 import { BlockFrameProps } from "./blocktypes";
 
-function handleHeaderContextMenu(
+async function handleHeaderContextMenu(
     e: React.MouseEvent<HTMLDivElement>,
     blockId: string,
     viewModel: ViewModel,
@@ -38,6 +41,8 @@ function handleHeaderContextMenu(
 ) {
     e.preventDefault();
     e.stopPropagation();
+    // other windows' tabs are loaded before the menu opens
+    const sendItems = await getSendBlockMenuItems(blockId);
     const magnified = globalStore.get(nodeModel.isMagnified);
     let menu: ContextMenuItem[] = [
         {
@@ -46,6 +51,8 @@ function handleHeaderContextMenu(
                 nodeModel.toggleMagnify();
             },
         },
+        { type: "separator" },
+        ...sendItems,
         { type: "separator" },
         {
             label: "Copy BlockId",
@@ -113,10 +120,15 @@ type HeaderEndIconsProps = {
     blockId: string;
 };
 
-const COLLAPSED_SIZE = 5; // percentage — just enough for the header bar
-const COLLAPSED_THRESHOLD = 8; // if size is at or below this, consider it collapsed
+// Pixel height of the collapsed pane: the header bar plus a little room for the frame border.
+function getCollapsedPixels(nodeModel: NodeModel): number {
+    const headerElem = nodeModel.dragHandleRef?.current;
+    if (!headerElem) return 0;
+    const FRAME_BORDER_PX = 4;
+    return headerElem.offsetHeight + FRAME_BORDER_PX;
+}
 
-function toggleCollapseBlock(blockId: string, nodeId: string) {
+function toggleCollapseBlock(blockId: string, nodeModel: NodeModel) {
     const layoutModel = getLayoutModelForStaticTab();
     if (!layoutModel) return;
     const node = layoutModel.getNodeByBlockId(blockId);
@@ -133,43 +145,25 @@ function toggleCollapseBlock(blockId: string, nodeId: string) {
     const blockData = globalStore.get(blockAtom);
     const isCollapsed = blockData?.meta?.["frame:collapsed"] ?? false;
 
-    // Split siblings into collapsed (frozen) and expandable — use metadata not size
-    const allSiblings = parent.children.filter((c) => c.id !== node.id);
-    const collapsedSiblings = allSiblings.filter((s) => {
-        const sibOref = WOS.makeORef("block", s.data?.blockId);
-        const sibAtom = WOS.getWaveObjectAtom<Block>(sibOref);
+    // Sizes are relative weights; mark siblings that are themselves collapsed (frozen) via metadata
+    const siblings: CollapseSibling[] = parent.children.map((c) => {
+        if (c.id === node.id) return { id: c.id, size: c.size };
+        const sibAtom = WOS.getWaveObjectAtom<Block>(WOS.makeORef("block", c.data?.blockId));
         const sibData = globalStore.get(sibAtom);
-        return sibData?.meta?.["frame:collapsed"] ?? false;
+        return { id: c.id, size: c.size, collapsed: sibData?.meta?.["frame:collapsed"] ?? false };
     });
-    const expandableSiblings = allSiblings.filter((s) => !collapsedSiblings.includes(s));
-    const collapsedTotal = collapsedSiblings.reduce((sum, s) => sum + s.size, 0);
+
+    // Fraction of the parent that equals the header height in pixels
+    // (pixelToSizeRatio = total child weight / parent pixels)
+    const totalWeight = siblings.reduce((acc, s) => acc + s.size, 0);
+    const pixelToSizeRatio = layoutModel.getNodeAdditionalProperties(parent)?.pixelToSizeRatio;
+    const parentPixels = pixelToSizeRatio > 0 ? totalWeight / pixelToSizeRatio : 0;
+    const collapsedFraction = computeCollapsedFraction(getCollapsedPixels(nodeModel), parentPixels);
 
     if (isCollapsed) {
-        // EXPAND: restore previous size from metadata, or default to fair share
-        const savedSize = blockData?.meta?.["frame:prevsize"];
-        const restoreSize = (savedSize && savedSize > COLLAPSED_THRESHOLD && savedSize <= 95)
-            ? savedSize
-            : Math.floor(100 / parent.children.length);
-        const resizeOps: { nodeId: string; size: number }[] = [{ nodeId: node.id, size: restoreSize }];
-        // Collapsed siblings stay frozen at their current size
-        for (const sib of collapsedSiblings) {
-            resizeOps.push({ nodeId: sib.id, size: sib.size });
-        }
-        // Only take space from expandable siblings
-        const expandableTotal = expandableSiblings.reduce((sum, s) => sum + s.size, 0);
-        const newExpandableTotal = 100 - restoreSize - collapsedTotal;
-        let allocated = restoreSize + collapsedTotal;
-        for (let i = 0; i < expandableSiblings.length; i++) {
-            const sib = expandableSiblings[i];
-            if (i === expandableSiblings.length - 1) {
-                resizeOps.push({ nodeId: sib.id, size: 100 - allocated });
-            } else {
-                const ratio = expandableTotal > 0 ? sib.size / expandableTotal : 1 / expandableSiblings.length;
-                const newSize = ratio * newExpandableTotal;
-                resizeOps.push({ nodeId: sib.id, size: newSize });
-                allocated += newSize;
-            }
-        }
+        // EXPAND: restore previous share of the parent, or default to fair share
+        const resizeOps = computeExpand(siblings, node.id, blockData?.meta?.["frame:prevsize"], collapsedFraction);
+        if (!resizeOps) return;
         layoutModel.treeReducer({
             type: LayoutTreeActionType.ResizeNode,
             resizeOperations: resizeOps,
@@ -179,38 +173,21 @@ function toggleCollapseBlock(blockId: string, nodeId: string) {
             meta: { "frame:collapsed": false },
         });
     } else {
-        // COLLAPSE: save current size, shrink to minimum
-        const currentSize = node.size;
-        const resizeOps: { nodeId: string; size: number }[] = [{ nodeId: node.id, size: COLLAPSED_SIZE }];
-        const freedSpace = currentSize - COLLAPSED_SIZE;
-        // Collapsed siblings stay frozen at their current size
-        for (const sib of collapsedSiblings) {
-            resizeOps.push({ nodeId: sib.id, size: sib.size });
-        }
-        // Only give freed space to expandable siblings
-        const expandableTotal = expandableSiblings.reduce((sum, s) => sum + s.size, 0);
-        let allocated = COLLAPSED_SIZE + collapsedTotal;
-        for (let i = 0; i < expandableSiblings.length; i++) {
-            const sib = expandableSiblings[i];
-            if (i === expandableSiblings.length - 1) {
-                resizeOps.push({ nodeId: sib.id, size: 100 - allocated });
-            } else {
-                const ratio = expandableTotal > 0 ? sib.size / expandableTotal : 1 / expandableSiblings.length;
-                const newSize = sib.size + ratio * freedSpace;
-                resizeOps.push({ nodeId: sib.id, size: newSize });
-                allocated += newSize;
-            }
-        }
+        // COLLAPSE: save current share (fraction of total), shrink to header height
+        const result = computeCollapse(siblings, node.id, collapsedFraction);
+        if (!result) return;
         layoutModel.treeReducer({
             type: LayoutTreeActionType.ResizeNode,
-            resizeOperations: resizeOps,
+            resizeOperations: result.ops,
         } as LayoutTreeResizeNodeAction);
         RpcApi.SetMetaCommand(TabRpcClient, {
             oref: blockOref,
-            meta: { "frame:collapsed": true, "frame:prevsize": currentSize },
+            meta: { "frame:collapsed": true, "frame:prevsize": result.prevFraction },
         });
     }
 }
+
+const emptyAdditionalPropsAtom = jotai.atom({});
 
 const HeaderEndIcons = React.memo(({ viewModel, nodeModel, blockId }: HeaderEndIconsProps) => {
     const endIconButtons = util.useAtomValueSafe(viewModel?.endIconButtons);
@@ -257,9 +234,12 @@ const HeaderEndIcons = React.memo(({ viewModel, nodeModel, blockId }: HeaderEndI
         );
     }
 
-    // Collapse/expand toggle — only in vertical layouts with siblings
-    const canCollapse = React.useMemo(() => {
-        const layoutModel = getLayoutModelForStaticTab();
+    // Collapse/expand toggle — only in vertical layouts with siblings.
+    // Subscribe to additionalProps (recomputed on every tree change) so this re-evaluates when
+    // the parent's orientation or children change, not just when the leaf count does.
+    const layoutModel = getLayoutModelForStaticTab();
+    jotai.useAtomValue(layoutModel?.additionalProps ?? emptyAdditionalPropsAtom);
+    const canCollapse = (() => {
         if (!layoutModel) return false;
         const node = layoutModel.getNodeByBlockId(blockId);
         if (!node) return false;
@@ -267,14 +247,14 @@ const HeaderEndIcons = React.memo(({ viewModel, nodeModel, blockId }: HeaderEndI
         if (!parent?.children || parent.children.length < 2) return false;
         if (parent.flexDirection !== FlexDirection.Column) return false;
         return true;
-    }, [blockId, numLeafs]);
+    })();
 
     if (canCollapse) {
         const collapseDecl: IconButtonDecl = {
             elemtype: "iconbutton",
             icon: isCollapsed ? "chevron-right" : "chevron-down",
             title: isCollapsed ? "Expand" : "Collapse",
-            click: () => toggleCollapseBlock(blockId, nodeModel.nodeId),
+            click: () => toggleCollapseBlock(blockId, nodeModel),
         };
         endIconsElem.push(<IconButton key="collapse" decl={collapseDecl} />);
     }
@@ -387,10 +367,14 @@ const BlockFrame_Header = ({
                 />
             )}
             {isTerminalBlock && (
-                <TmuxDetachButton
+                <SessionButton
                     blockId={nodeModel.blockId}
-                    cwd={(blockData?.meta?.["cmd:cwd"] as string) ?? ""}
+                    savedHost={blockData?.meta?.["session:host"]}
+                    savedSession={blockData?.meta?.["session:tmux"]}
                 />
+            )}
+            {isTerminalBlock && (
+                <TmuxDetachButton blockId={nodeModel.blockId} cwd={(blockData?.meta?.["cmd:cwd"] as string) ?? ""} />
             )}
             {isTerminalBlock && (
                 <span

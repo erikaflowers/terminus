@@ -27,7 +27,6 @@ import {
     isWslConnName,
     NullAtom,
 } from "@/util/util";
-import { isPreviewWindow } from "./windowtype";
 import { atom, Atom, PrimitiveAtom, useAtomValue } from "jotai";
 import {
     atoms,
@@ -40,6 +39,7 @@ import {
 import { globalStore } from "./jotaiStore";
 import { modalsModel } from "./modalmodel";
 import { ClientService, ObjectService } from "./services";
+import { isPreviewWindow } from "./windowtype";
 import * as WOS from "./wos";
 import { getFileSubject, waveEventSubscribeSingle } from "./wps";
 
@@ -60,6 +60,60 @@ function initGlobal(initOpts: GlobalInitOptions) {
     }
 }
 
+// Cloud sync: config files that are synced. Must match SYNC_CONFIG_KEYS in emain/emain-oauth.ts.
+// agent-preferences.json is deliberately not synced (it holds the OAuth client secret).
+const SYNC_CONFIG_KEYS = ["settings", "connections", "widgets"];
+
+// Secret-bearing keys (e.g. "ai:apitoken") are never uploaded. "token(?!s)" keeps "ai:maxtokens".
+// Keep in sync with SECRET_KEY_RE in emain/emain-oauth.ts (which also strips, as a backstop).
+const SECRET_CONFIG_KEY_RE = /apitoken|apikey|api_key|secret|password|token(?!s)/i;
+
+function stripSecretConfigKeys(data: any): any {
+    if (Array.isArray(data)) {
+        return data.map(stripSecretConfigKeys);
+    }
+    if (data == null || typeof data !== "object") {
+        return data;
+    }
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(data)) {
+        if (SECRET_CONFIG_KEY_RE.test(k)) continue;
+        out[k] = stripSecretConfigKeys(v);
+    }
+    return out;
+}
+
+// Read the synced config files (secrets stripped). Missing/invalid files are skipped.
+async function collectSyncConfigs(): Promise<Record<string, any>> {
+    const configDir = getApi().getConfigDir();
+    const configs: Record<string, any> = {};
+    for (const key of SYNC_CONFIG_KEYS) {
+        try {
+            const raw = await getApi().readTextFile(configDir + "/" + key + ".json");
+            if (raw) configs[key] = stripSecretConfigKeys(JSON.parse(raw));
+        } catch {
+            // file doesn't exist or isn't valid JSON, skip
+        }
+    }
+    return configs;
+}
+
+let lastPushedSyncContent: string = null;
+
+// Push the synced configs now. Returns null if there was nothing to push.
+// The main process additionally skips content equal to what was last pulled or pushed.
+async function pushCloudSyncNow(): Promise<{ ok: boolean; updated_at?: string; error?: string }> {
+    const configs = await collectSyncConfigs();
+    if (Object.keys(configs).length === 0) {
+        return null;
+    }
+    const result = await getApi().terminusSyncPush(configs);
+    if (result?.ok) {
+        lastPushedSyncContent = JSON.stringify(configs);
+    }
+    return result;
+}
+
 // Cloud sync: debounced push on config change
 let cloudSyncTimer: ReturnType<typeof setTimeout> | null = null;
 const CLOUD_SYNC_DEBOUNCE_MS = 5000;
@@ -72,21 +126,16 @@ function debouncedCloudSyncPush() {
             try {
                 const status = await getApi().terminusAuthStatus();
                 if (!status.loggedIn || !status.syncEnabled) return;
-                // Read all synced config files and push
-                const configDir = getApi().getConfigDir();
-                const syncKeys = ["settings", "connections", "widgets", "agents"];
-                const configs: Record<string, any> = {};
-                for (const key of syncKeys) {
-                    try {
-                        const raw = await getApi().readTextFile(configDir + "/" + key + ".json");
-                        if (raw) configs[key] = JSON.parse(raw);
-                    } catch {
-                        // file doesn't exist or isn't valid JSON, skip
+                const configs = await collectSyncConfigs();
+                if (Object.keys(configs).length === 0) return;
+                // config events fire for unrelated files too; skip if nothing synced changed
+                if (JSON.stringify(configs) === lastPushedSyncContent) return;
+                const result = await getApi().terminusSyncPush(configs);
+                if (result?.ok) {
+                    lastPushedSyncContent = JSON.stringify(configs);
+                    if (!result.skipped) {
+                        console.log("cloud sync: pushed configs after change");
                     }
-                }
-                if (Object.keys(configs).length > 0) {
-                    await getApi().terminusSyncPush(configs);
-                    console.log("cloud sync: pushed configs after change");
                 }
             } catch (e) {
                 console.log("cloud sync: push failed", e);
@@ -794,12 +843,20 @@ function recordTEvent(event: string, props?: TEventProps) {
     RpcApi.RecordTEventCommand(TabRpcClient, { event, props }, { noresponse: true });
 }
 
-export { ConnStatusMapAtom, getAtoms, initGlobalAtoms, orefAtomCache, TabIndicatorMap, blockComponentModelMap } from "./global-atoms";
+export {
+    blockComponentModelMap,
+    ConnStatusMapAtom,
+    getAtoms,
+    initGlobalAtoms,
+    orefAtomCache,
+    TabIndicatorMap,
+} from "./global-atoms";
 
 export {
     atoms,
     clearAllTabIndicators,
     clearTabIndicatorFromFocus,
+    collectSyncConfigs,
     createBlock,
     createBlockSplitHorizontally,
     createBlockSplitVertically,
@@ -829,6 +886,7 @@ export {
     loadConnStatus,
     loadTabIndicators,
     openLink,
+    pushCloudSyncNow,
     readAtom,
     recordTEvent,
     refocusNode,

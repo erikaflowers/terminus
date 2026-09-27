@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wavetermdev/waveterm/pkg/blockcontroller"
+	"github.com/wavetermdev/waveterm/pkg/eventbus"
 	"github.com/wavetermdev/waveterm/pkg/panichandler"
 	"github.com/wavetermdev/waveterm/pkg/tsgen/tsgenmeta"
 	"github.com/wavetermdev/waveterm/pkg/waveobj"
@@ -163,6 +164,64 @@ func (svc *WorkspaceService) CreateTab(workspaceId string, tabName string, activ
 		wps.Broker.SendUpdateEvents(updates)
 	}()
 	return tabId, updates, nil
+}
+
+func (svc *WorkspaceService) MoveBlockToTab_Meta() tsgenmeta.MethodMeta {
+	return tsgenmeta.MethodMeta{
+		Desc:       "move a block to another tab in any window (empty dstTabId = a new tab in dstWorkspaceId, or in the source tab's workspace if that's empty too); the block's process keeps running",
+		ArgNames:   []string{"srcTabId", "blockId", "dstTabId", "dstWorkspaceId"},
+		ReturnDesc: "dstTabId",
+	}
+}
+
+func (svc *WorkspaceService) MoveBlockToTab(srcTabId string, blockId string, dstTabId string, dstWorkspaceId string) (string, waveobj.UpdatesRtnType, error) {
+	ctx, cancelFn := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancelFn()
+	ctx = waveobj.ContextWithUpdates(ctx)
+	srcWsId, err := wstore.DBFindWorkspaceForTabId(ctx, srcTabId)
+	if err != nil {
+		return "", nil, fmt.Errorf("error finding workspace for tab: %w", err)
+	}
+	if dstTabId == "" {
+		if dstWorkspaceId == "" {
+			dstWorkspaceId = srcWsId
+		}
+		dstTabId, err = wcore.CreateEmptyTab(ctx, dstWorkspaceId, false)
+		if err != nil {
+			return "", nil, fmt.Errorf("error creating tab: %w", err)
+		}
+	} else {
+		dstWorkspaceId, err = wstore.DBFindWorkspaceForTabId(ctx, dstTabId)
+		if err != nil {
+			return "", nil, fmt.Errorf("error finding workspace for destination tab: %w", err)
+		}
+	}
+	err = wcore.MoveBlockToTab(ctx, srcTabId, dstTabId, blockId)
+	if err != nil {
+		return "", nil, fmt.Errorf("error moving block: %w", err)
+	}
+	crossWindow := dstWorkspaceId != srcWsId
+	if crossWindow {
+		// the calling window can't switch another window's tab; make it active there and raise that window
+		err = wcore.SetActiveTab(ctx, dstWorkspaceId, dstTabId)
+		if err != nil {
+			return "", nil, fmt.Errorf("error activating destination tab: %w", err)
+		}
+	}
+	updates := waveobj.ContextGetUpdatesRtn(ctx)
+	go func() {
+		defer func() {
+			panichandler.PanicHandler("WorkspaceService:MoveBlockToTab:SendUpdateEvents", recover())
+		}()
+		wps.Broker.SendUpdateEvents(updates)
+		if crossWindow {
+			eventbus.SendEventToElectron(eventbus.WSEventType{
+				EventType: eventbus.WSEvent_ElectronUpdateActiveTab,
+				Data:      &waveobj.ActiveTabUpdate{WorkspaceId: dstWorkspaceId, NewActiveTabId: dstTabId, Focus: true},
+			})
+		}
+	}()
+	return dstTabId, updates, nil
 }
 
 func (svc *WorkspaceService) UpdateTabIds_Meta() tsgenmeta.MethodMeta {

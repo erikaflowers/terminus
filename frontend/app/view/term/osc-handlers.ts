@@ -1,6 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import { noteShellCommand } from "@/app/block/sessionrestore";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
 import {
@@ -28,7 +29,7 @@ export type ShellIntegrationStatus = "ready" | "running-command";
 
 type Osc16162Command =
     | { command: "A"; data: Record<string, never> }
-    | { command: "C"; data: { cmd64?: string } }
+    | { command: "C"; data: { cmd64?: string; cmdx64?: string } }
     | {
           command: "M";
           data: {
@@ -82,7 +83,7 @@ function checkCommandForTelemetry(decodedCmd: string) {
 function handleShellIntegrationCommandStart(
     termWrap: TermWrap,
     blockId: string,
-    cmd: { command: "C"; data: { cmd64?: string } },
+    cmd: { command: "C"; data: { cmd64?: string; cmdx64?: string } },
     rtInfo: ObjRTInfo // this is passed by reference and modified inside of this function
 ): void {
     rtInfo["shell:state"] = "running-command";
@@ -103,6 +104,12 @@ function handleShellIntegrationCommandStart(
                 rtInfo["shell:lastcmd"] = decodedCmd;
                 globalStore.set(termWrap.lastCommandAtom, decodedCmd);
                 checkCommandForTelemetry(decodedCmd);
+                // Session Restore: notice "ssh host …" (cmdx64 = the line with aliases like `macstudio` expanded)
+                let expandedCmd: string = null;
+                try {
+                    expandedCmd = cmd.data.cmdx64 ? base64ToString(cmd.data.cmdx64) : null;
+                } catch (_) {}
+                noteShellCommand(blockId, decodedCmd, expandedCmd);
             } catch (e) {
                 console.error("Error decoding cmd64:", e);
                 rtInfo["shell:lastcmd"] = null;
@@ -287,6 +294,10 @@ export function handleOsc16162Command(data: string, blockId: string, loaded: boo
         case "A": {
             rtInfo["shell:state"] = "ready";
             globalStore.set(termWrap.shellIntegrationStatusAtom, "ready");
+            // The shell is drawing its prompt, so whatever ran in the foreground has exited. If that was
+            // ssh/tmux and the connection dropped, the "mouse off" never arrived; the shell itself never
+            // turns mouse reporting on, so any mode still set here is stale (else scrolls flood the prompt).
+            termWrap.resetStaleInputModes("shell prompt");
             const marker = terminal.registerMarker(0);
             if (marker) {
                 termWrap.promptMarkers.push(marker);

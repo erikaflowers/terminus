@@ -1,12 +1,12 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Popover, PopoverButton, PopoverContent } from "@/element/popover";
-import { getRemoteConfig, getTmuxCmd } from "@/app/store/agents";
+import { buildTmuxAttachInitScript } from "@/app/store/agents";
 import { atoms, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
+import { Popover, PopoverButton, PopoverContent } from "@/element/popover";
 import * as React from "react";
 
 interface TmuxDetachButtonProps {
@@ -14,8 +14,15 @@ interface TmuxDetachButtonProps {
     cwd: string;
 }
 
+// Map anything outside isSafeSessionName's charset (letters, digits, _ . -) to "-". Dots are
+// replaced too, since tmux treats "." in a target as a window/pane separator.
 function sanitizeSessionName(name: string): string {
-    return name.replace(/[.:\/\s]+/g, "-").replace(/^-+|-+$/g, "") || "session";
+    return (
+        name
+            .replace(/[^A-Za-z0-9_-]+/g, "-")
+            .replace(/^-+|-+$/g, "")
+            .slice(0, 64) || "session"
+    );
 }
 
 function getDefaultSessionName(cwd: string): string {
@@ -33,18 +40,8 @@ export const TmuxDetachButton = React.memo(({ blockId, cwd }: TmuxDetachButtonPr
 
     const handleDetach = React.useCallback(async () => {
         const name = sanitizeSessionName(sessionName);
-        if (!name) return;
-
-        const remote = getRemoteConfig();
-        const tmux = getTmuxCmd();
-        const cwdArg = cwd ? ` -c "${cwd}"` : "";
-
-        let initScript: string;
-        if (remote?.remoteHost) {
-            initScript = `ssh ${remote.remoteHost} -t "${tmux} new-session -A -s ${name}${cwdArg}"\n`;
-        } else {
-            initScript = `${tmux} new-session -A -s ${name}${cwdArg}\n`;
-        }
+        const initScript = buildTmuxAttachInitScript(name, cwd);
+        if (!initScript) return;
 
         const tabId = globalStore.get(atoms.staticTabId);
 
@@ -97,9 +94,7 @@ export const TmuxDetachButton = React.memo(({ blockId, cwd }: TmuxDetachButtonPr
                         width: 240,
                     }}
                 >
-                    <div style={{ color: "var(--main-text-color)", fontSize: 12, fontWeight: 600 }}>
-                        Detach to tmux
-                    </div>
+                    <div style={{ color: "var(--main-text-color)", fontSize: 12, fontWeight: 600 }}>Detach to tmux</div>
                     <input
                         type="text"
                         value={sessionName}

@@ -4,9 +4,15 @@
 // Shared data fetching for visualizer panels
 
 import { getApi } from "@/app/store/global";
+import { shellQuote } from "@/util/shellquote";
 
-const FLEET_DB = "~/.claude/hooks/fleet-log.db";
-const HOPPER_INBOX = "~/.claude/hooks/hopper-inbox.jsonl";
+// Resolve the home dir explicitly: a "~" inside single quotes is never expanded by the shell.
+function hooksPath(file: string): string {
+    return `${getApi().getHomeDir()}/.claude/hooks/${file}`;
+}
+const fleetDb = () => hooksPath("fleet-log.db");
+// The Hopper drains hopper-inbox.jsonl every few seconds; it keeps a history of everything it consumed.
+const hopperInbox = () => hooksPath("hopper-inbox.history.jsonl");
 const FLEET_POLL_MS = 30_000;
 const HOPPER_POLL_MS = 10_000;
 
@@ -24,7 +30,7 @@ let fleetListeners = 0;
 
 async function pollFleet(): Promise<void> {
     try {
-        const cmd = `/usr/bin/sqlite3 -json '${FLEET_DB}' "SELECT agent_name, last_commit_hash, summary FROM agent_logs ORDER BY id DESC LIMIT 30"`;
+        const cmd = `/usr/bin/sqlite3 -json ${shellQuote(fleetDb())} "SELECT agent_name, last_commit_hash, summary FROM agent_logs ORDER BY id DESC LIMIT 30"`;
         const result = await getApi().execCommand(cmd);
         if (result.stdout) {
             const rows = JSON.parse(result.stdout);
@@ -69,24 +75,41 @@ export interface InboxEntry {
 }
 
 let inboxCache: InboxEntry[] = [];
+
+const optionalString = (v: unknown): v is string | undefined => v === undefined || typeof v === "string";
+
+/** Accept only well-formed entries; the panels call string methods on these fields every frame. */
+function toInboxEntry(raw: unknown): InboxEntry | null {
+    if (raw == null || typeof raw !== "object") return null;
+    const e = raw as Record<string, unknown>;
+    if (typeof e.from !== "string" || !e.from) return null;
+    if (!optionalString(e.to) || !optionalString(e.signal)) return null;
+    return {
+        from: e.from,
+        to: e.to as string | undefined,
+        signal: e.signal as string | undefined,
+        payload: typeof e.payload === "string" ? e.payload : undefined,
+        ts: typeof e.ts === "string" ? e.ts : typeof e.ts === "number" ? String(e.ts) : "",
+    };
+}
 let inboxTimer: ReturnType<typeof setInterval> | null = null;
 let inboxListeners = 0;
 
 async function pollInbox(): Promise<void> {
     try {
-        const cmd = `tail -50 ${HOPPER_INBOX} 2>/dev/null`;
+        const cmd = `tail -50 ${shellQuote(hopperInbox())} 2>/dev/null`;
         const result = await getApi().execCommand(cmd);
         if (result.stdout) {
             const lines = result.stdout.trim().split("\n").filter(Boolean);
             inboxCache = lines
                 .map((line) => {
                     try {
-                        return JSON.parse(line) as InboxEntry;
+                        return toInboxEntry(JSON.parse(line));
                     } catch {
                         return null;
                     }
                 })
-                .filter(Boolean);
+                .filter((e): e is InboxEntry => e != null);
         }
     } catch {
         // silent
@@ -120,7 +143,7 @@ let convListeners = 0;
 
 async function pollConversations(): Promise<void> {
     try {
-        const cmd = `/usr/bin/sqlite3 -json '${FLEET_DB}' "SELECT content FROM conversation_messages ORDER BY timestamp DESC LIMIT 20"`;
+        const cmd = `/usr/bin/sqlite3 -json ${shellQuote(fleetDb())} "SELECT content FROM conversation_messages ORDER BY timestamp DESC LIMIT 20"`;
         const result = await getApi().execCommand(cmd);
         if (result.stdout) {
             const rows = JSON.parse(result.stdout);

@@ -469,3 +469,179 @@ export async function getDevices(auth: AuthState): Promise<{ devices: any[] }> {
     }
     return kestrisRequest(devicesUrl, "GET", auth.id_token);
 }
+
+// ── Shared pull/push logic (used by the IPC handlers and the startup pull) ──
+
+// Config files that are synced. Must match SYNC_CONFIG_KEYS in frontend/app/store/global.ts.
+// agent-preferences.json is deliberately NOT synced: it holds the OAuth client secret.
+export const SYNC_CONFIG_KEYS = ["settings", "connections", "widgets"];
+
+// Secret-bearing keys (e.g. "ai:apitoken") never leave this machine and are never
+// overwritten by a pull. Keep in sync with isSecretConfigKey in frontend/app/store/global.ts.
+// "token(?!s)" so non-secret keys like "ai:maxtokens" still sync.
+const SECRET_KEY_RE = /apitoken|apikey|api_key|secret|password|token(?!s)/i;
+
+// Canonical content of each key as last pulled from / pushed to the cloud (secrets stripped).
+// Used to skip echo pushes (a pull triggers a config event, which triggers a push) and
+// duplicate pushes from multiple tabs.
+const lastSyncedContent = new Map<string, string>();
+let lastSyncedAt: string | null = null;
+
+function isPlainObject(v: any): boolean {
+    return v != null && typeof v === "object" && !Array.isArray(v);
+}
+
+export function stripSecretConfigKeys(data: any): any {
+    if (Array.isArray(data)) {
+        return data.map(stripSecretConfigKeys);
+    }
+    if (!isPlainObject(data)) {
+        return data;
+    }
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(data)) {
+        if (SECRET_KEY_RE.test(k)) continue;
+        out[k] = stripSecretConfigKeys(v);
+    }
+    return out;
+}
+
+// copy local secret-bearing keys back into pulled (secret-free) data so a pull never wipes them
+function restoreLocalSecrets(pulled: any, local: any): any {
+    if (!isPlainObject(pulled) || !isPlainObject(local)) {
+        return pulled;
+    }
+    for (const [k, v] of Object.entries(local)) {
+        if (SECRET_KEY_RE.test(k)) {
+            pulled[k] = v;
+        } else if (isPlainObject(pulled[k]) && isPlainObject(v)) {
+            restoreLocalSecrets(pulled[k], v);
+        }
+    }
+    return pulled;
+}
+
+function stableStringify(v: any): string {
+    if (Array.isArray(v)) {
+        return "[" + v.map(stableStringify).join(",") + "]";
+    }
+    if (isPlainObject(v)) {
+        const keys = Object.keys(v).sort();
+        return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(v[k])).join(",") + "}";
+    }
+    return JSON.stringify(v) ?? "null";
+}
+
+// Returns the on-disk path for a sync key, or null if the key is not allowlisted
+// or would resolve outside the config dir.
+function resolveSyncConfigPath(configDir: string, key: string): string | null {
+    if (!SYNC_CONFIG_KEYS.includes(key)) {
+        return null;
+    }
+    const baseDir = path.resolve(configDir);
+    const filePath = path.resolve(baseDir, `${key}.json`);
+    if (path.dirname(filePath) !== baseDir) {
+        return null;
+    }
+    return filePath;
+}
+
+/**
+ * Pull configs from the cloud and write the allowlisted ones into the config dir
+ * (the filewatcher picks them up). With skipNewerLocal, a local file modified after
+ * the cloud's updated_at is left alone (startup pull); manual pulls overwrite.
+ */
+export async function pullAndWriteConfigs(
+    auth: AuthState,
+    machineId: string,
+    opts: { skipNewerLocal: boolean }
+): Promise<{
+    configs: Record<string, any>;
+    devices: any[];
+    updated_at: string | null;
+    written: string[];
+    skipped: string[];
+}> {
+    const result = await pullConfigs(auth, machineId);
+    const configDir = getWaveConfigDir();
+    const cloudTime = result.updated_at ? Date.parse(result.updated_at) : NaN;
+    const written: string[] = [];
+    const skipped: string[] = [];
+    if (isPlainObject(result.configs)) {
+        for (const [key, data] of Object.entries(result.configs)) {
+            if (!isPlainObject(data)) continue;
+            const filePath = resolveSyncConfigPath(configDir, key);
+            if (filePath == null) {
+                console.log("cloud sync: ignoring non-allowlisted config key from server:", JSON.stringify(key));
+                continue;
+            }
+            let localMtime = 0;
+            let localData: any = null;
+            try {
+                localMtime = fs.statSync(filePath).mtimeMs;
+                localData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+            } catch {
+                // missing or invalid local file
+            }
+            if (opts.skipNewerLocal && localMtime > 0 && (isNaN(cloudTime) || localMtime > cloudTime)) {
+                skipped.push(key);
+                continue;
+            }
+            const cloudData = stripSecretConfigKeys(data);
+            const toWrite = restoreLocalSecrets(stripSecretConfigKeys(data), localData);
+            fs.writeFileSync(filePath, JSON.stringify(toWrite, null, 2), "utf-8");
+            lastSyncedContent.set(key, stableStringify(cloudData));
+            written.push(key);
+        }
+    }
+    if (result.updated_at) {
+        lastSyncedAt = result.updated_at;
+    }
+    if (skipped.length > 0) {
+        console.log("cloud sync: kept newer local configs (not overwritten):", skipped.join(", "));
+    }
+    return { ...result, written, skipped };
+}
+
+/**
+ * Push allowlisted configs (secrets stripped) to the cloud. Skips the request when the
+ * content matches what was last pulled or pushed.
+ */
+export async function pushSyncedConfigs(
+    auth: AuthState,
+    machineId: string,
+    configs: Record<string, any>
+): Promise<{ ok: boolean; updated_at: string; skipped?: boolean }> {
+    const toPush: Record<string, any> = {};
+    const content = new Map<string, string>();
+    let changed = false;
+    for (const [key, data] of Object.entries(configs ?? {})) {
+        if (!SYNC_CONFIG_KEYS.includes(key) || !isPlainObject(data)) continue;
+        toPush[key] = stripSecretConfigKeys(data);
+        content.set(key, stableStringify(toPush[key]));
+        if (lastSyncedContent.get(key) !== content.get(key)) {
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return { ok: true, updated_at: lastSyncedAt, skipped: true };
+    }
+    // record optimistically so concurrent pushes from other tabs are skipped; roll back on failure
+    const prevContent = new Map(lastSyncedContent);
+    for (const [key, s] of content) {
+        lastSyncedContent.set(key, s);
+    }
+    try {
+        const result = await pushConfigs(auth, machineId, toPush);
+        if (result?.updated_at) {
+            lastSyncedAt = result.updated_at;
+        }
+        return result;
+    } catch (e) {
+        lastSyncedContent.clear();
+        for (const [key, s] of prevContent) {
+            lastSyncedContent.set(key, s);
+        }
+        throw e;
+    }
+}

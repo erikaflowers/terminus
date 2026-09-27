@@ -13,17 +13,14 @@ import {
     applyGlow,
     BG_DARK,
     clearGlow,
-    GRID_DIM,
     GRID_BRIGHT,
+    GRID_DIM,
+    PHOSPHOR_AMBER,
     PHOSPHOR_GREEN,
     PHOSPHOR_GREEN_DIM,
-    PHOSPHOR_AMBER,
-    PHOSPHOR_CYAN,
-    PHOSPHOR_CYAN_DIM,
-    PHOSPHOR_RED,
     TEXT_DIM,
 } from "../vizutil/vizcolors";
-import { DrawFunction, clamp, lerp, useAnimationLoop, useCanvasSetup } from "../vizutil/vizutil";
+import { clamp, DrawFunction, lerp, useAnimationLoop, useCanvasSetup } from "../vizutil/vizutil";
 
 // --- Types ---
 
@@ -85,7 +82,10 @@ class AudioState {
             });
 
             const allTracks = stream.getTracks();
-            console.log("[visualizer] stream obtained, tracks:", allTracks.map(t => `${t.kind}:${t.label}:${t.readyState}`));
+            console.log(
+                "[visualizer] stream obtained, tracks:",
+                allTracks.map((t) => `${t.kind}:${t.label}:${t.readyState}`)
+            );
 
             // Keep video tracks alive for now (stopping them may kill the audio on some builds)
             const audioTracks = stream.getAudioTracks();
@@ -249,13 +249,7 @@ function hexRgba(hex: string, alpha: number): string {
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function drawSpectrum(
-    ctx: CanvasRenderingContext2D,
-    state: AudioState,
-    w: number,
-    h: number,
-    elapsed: number
-): void {
+function drawSpectrum(ctx: CanvasRenderingContext2D, state: AudioState, w: number, h: number, elapsed: number): void {
     const margin = 20;
     const plotW = w - margin * 2;
     const plotH = h - margin * 2 - 40; // leave room for metadata at bottom
@@ -270,7 +264,7 @@ function drawSpectrum(
     if (binRange <= 0) return;
 
     const numBars = Math.min(120, Math.floor(plotW / 4));
-    const barW = Math.max(2, (plotW / numBars) - 1);
+    const barW = Math.max(2, plotW / numBars - 1);
     const gap = 1;
 
     for (let i = 0; i < numBars; i++) {
@@ -311,7 +305,7 @@ function drawSpectrum(
     // Frequency labels (reflect actual range)
     ctx.font = "8px 'JetBrains Mono', monospace";
     ctx.fillStyle = TEXT_DIM;
-    const fmtHz = (f: number) => f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}Hz`;
+    const fmtHz = (f: number) => (f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}Hz`);
     ctx.fillText(fmtHz(state.freqLow), margin, margin + plotH + 12);
     ctx.textAlign = "right";
     ctx.fillText(fmtHz(state.freqHigh), margin + plotW, margin + plotH + 12);
@@ -358,7 +352,7 @@ function drawWaveformViz(
     for (let i = 0; i < plotW; i++) {
         const idx = Math.floor((i / plotW) * binCount);
         const val = state.timeData[idx] ?? 128;
-        const y = margin + ((val / 255) * plotH);
+        const y = margin + (val / 255) * plotH;
         const jitter = Math.sin(elapsed / 200 + i * 0.3) * 2;
         if (i === 0) ctx.moveTo(margin + i, y + jitter);
         else ctx.lineTo(margin + i, y + jitter);
@@ -373,7 +367,7 @@ function drawWaveformViz(
     for (let i = 0; i < plotW; i++) {
         const idx = Math.floor((i / plotW) * binCount);
         const val = state.timeData[idx] ?? 128;
-        const y = margin + ((val / 255) * plotH);
+        const y = margin + (val / 255) * plotH;
         if (i === 0) ctx.moveTo(margin + i, y);
         else ctx.lineTo(margin + i, y);
     }
@@ -478,7 +472,7 @@ function drawSpectrumSplit(
 
     // --- Low band layer (warm, wide bars, heavy glow) ---
     const numLowBars = Math.min(50, Math.floor(plotW / 6));
-    const lowBarW = Math.max(3, (plotW / numLowBars) - 2);
+    const lowBarW = Math.max(3, plotW / numLowBars - 2);
 
     for (let i = 0; i < numLowBars; i++) {
         const t = i / numLowBars;
@@ -500,7 +494,7 @@ function drawSpectrumSplit(
 
     // --- High band layer (cool, thin bars, sharp) ---
     const numHighBars = Math.min(90, Math.floor(plotW / 4));
-    const highBarW = Math.max(2, (plotW / numHighBars) - 1);
+    const highBarW = Math.max(2, plotW / numHighBars - 1);
 
     for (let i = 0; i < numHighBars; i++) {
         const t = i / numHighBars;
@@ -537,7 +531,7 @@ function drawSpectrumSplit(
 
     // Labels
     ctx.font = "8px 'JetBrains Mono', monospace";
-    const fmtHz = (f: number) => f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}Hz`;
+    const fmtHz = (f: number) => (f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}Hz`);
     ctx.fillStyle = "rgba(255, 140, 0, 0.5)";
     ctx.fillText("LOW", margin, margin + plotH + 12);
     ctx.fillStyle = TEXT_DIM;
@@ -818,7 +812,7 @@ function drawIdleAnimation(
 
     // Ambient noise floor bars — very dim, slowly undulating
     const numBars = 60;
-    const barW = Math.max(2, (plotW / numBars) - 1);
+    const barW = Math.max(2, plotW / numBars - 1);
     for (let i = 0; i < numBars; i++) {
         const val = 3 + Math.sin(state.idlePhase + i * 0.3) * 2 + Math.random() * 2;
         const barH = (val / 255) * plotH;
@@ -861,12 +855,7 @@ function drawIdleAnimation(
     ctx.textAlign = "left";
 }
 
-function drawNowPlaying(
-    ctx: CanvasRenderingContext2D,
-    np: NowPlaying | null,
-    w: number,
-    h: number
-): void {
+function drawNowPlaying(ctx: CanvasRenderingContext2D, np: NowPlaying | null, w: number, h: number): void {
     if (!np) return;
 
     const bottomY = h - 28;
@@ -892,7 +881,8 @@ function createDrawFn(state: AudioState): DrawFunction {
         ctx.fillRect(0, 0, width, height);
 
         // Seismic shake on intense bass
-        let shakeX = 0, shakeY = 0;
+        let shakeX = 0,
+            shakeY = 0;
         if (state.bassEnergy > 0.45 || state.bassHitDecay > 0.3) {
             const intensity = Math.max(state.bassEnergy - 0.4, 0) * 5 + state.bassHitDecay * 0.5;
             const shake = clamp(intensity, 0, 1);
@@ -958,10 +948,7 @@ function createDrawFn(state: AudioState): DrawFunction {
 
         // Static snow on intense bass — specs of white/colored noise
         if (state.bassEnergy > 0.4 || state.bassHitDecay > 0.4) {
-            const snowIntensity = clamp(
-                Math.max(state.bassEnergy - 0.35, 0) * 4 + state.bassHitDecay * 0.6,
-                0, 1
-            );
+            const snowIntensity = clamp(Math.max(state.bassEnergy - 0.35, 0) * 4 + state.bassHitDecay * 0.6, 0, 1);
             const numSpecs = Math.floor(snowIntensity * 120);
             for (let i = 0; i < numSpecs; i++) {
                 const sx = Math.random() * width;
@@ -990,39 +977,48 @@ function createDrawFn(state: AudioState): DrawFunction {
 
 // --- Now Playing Polling ---
 
-const METADATA_SCRIPT = `osascript -e 'tell application "Music"
-  if player state is playing then
-    set t to name of current track
-    set a to artist of current track
-    set al to album of current track
-    return t & "|||" & a & "|||" & al
-  else
-    return "STOPPED"
-  end if
-end tell' 2>/dev/null || echo ""`;
-
-const ARTWORK_SCRIPT = `osascript -e 'tell application "Music"
-  if player state is playing then
-    set artworks to artworks of current track
-    if (count of artworks) > 0 then
-      set artData to raw data of artwork 1 of current track
-      set tmpPath to POSIX path of (path to temporary items folder) & "terminus-artwork.jpg"
-      try
-        set fRef to open for access tmpPath with write permission
-        set eof fRef to 0
-        write artData to fRef
-        close access fRef
-        return tmpPath
-      on error
-        try
-          close access tmpPath
-        end try
-        return ""
-      end try
+// Both scripts check `application "Music" is running` first: that check does not launch the app,
+// whereas a bare `tell application "Music"` relaunches it on every poll after the user quits it.
+const METADATA_SCRIPT = `osascript -e 'if application "Music" is running then
+  tell application "Music"
+    if player state is playing then
+      set t to name of current track
+      set a to artist of current track
+      set al to album of current track
+      return t & "|||" & a & "|||" & al
+    else
+      return "STOPPED"
     end if
-  end if
-  return ""
-end tell' 2>/dev/null || echo ""`;
+  end tell
+else
+  return "STOPPED"
+end if' 2>/dev/null || echo ""`;
+
+const ARTWORK_SCRIPT = `osascript -e 'if application "Music" is running then
+  tell application "Music"
+    if player state is playing then
+      set artworks to artworks of current track
+      if (count of artworks) > 0 then
+        set artData to raw data of artwork 1 of current track
+        set tmpPath to POSIX path of (path to temporary items folder) & "terminus-artwork.jpg"
+        try
+          set fRef to open for access tmpPath with write permission
+          set eof fRef to 0
+          write artData to fRef
+          close access fRef
+          return tmpPath
+        on error
+          try
+            close access tmpPath
+          end try
+          return ""
+        end try
+      end if
+    end if
+    return ""
+  end tell
+end if
+return ""' 2>/dev/null || echo ""`;
 
 function useNowPlaying(stateRef: React.RefObject<AudioState>): void {
     React.useEffect(() => {
@@ -1422,9 +1418,21 @@ const FreqRangeSlider: React.FC<{
 // --- Settings Persistence (file-based, survives panel close/reopen) ---
 
 const VIZ_SETTINGS_KEYS = [
-    "mode", "freqLow", "freqHigh", "crossover", "splitMode",
-    "colorLowDim", "colorLowBright", "colorHighDim", "colorHighBright",
-    "attack", "release", "lowAttack", "lowRelease", "highAttack", "highRelease",
+    "mode",
+    "freqLow",
+    "freqHigh",
+    "crossover",
+    "splitMode",
+    "colorLowDim",
+    "colorLowBright",
+    "colorHighDim",
+    "colorHighBright",
+    "attack",
+    "release",
+    "lowAttack",
+    "lowRelease",
+    "highAttack",
+    "highRelease",
 ] as const;
 
 function getVizPrefsPath(): string {
