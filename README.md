@@ -1,6 +1,6 @@
 # Terminus
 
-**A mission control terminal for AI agent crews.** Built on [Wave Terminal](https://github.com/wavetermdev/waveterm) (v0.14.1).
+**A mission control terminal for AI agent crews.** Built on [Wave Terminal](https://github.com/wavetermdev/waveterm) (forked at v0.14.1). Current release: **0.14.3** (tag `terminus-v0.14.3`, see [RELEASES.md](RELEASES.md)).
 
 Terminus is an Electron-based terminal multiplexer designed for orchestrating multiple AI agents running in parallel tmux sessions. Each agent gets its own identity, terminal theme, persistent session, and avatar — all managed from a single unified interface.
 
@@ -17,6 +17,23 @@ Every terminal pane can be assigned to an agent. The header shows the agent's na
 - Per-agent preferences persist across sessions
 - Re-selecting the same agent forces reconnect (broken pipe recovery)
 - Local and remote (SSH) tmux session support with auto-detected tmux paths
+
+### Panes Follow You (0.14.2 / 0.14.3)
+
+Your work lives in tmux on your machines; Terminus panes are windows onto it. These features make a pane's session portable:
+
+- **Move a pane to another tab or window.** Right-click a pane header (or its cog): **Send to Tab ▸** [tabs in this window…, New Tab], **Send to Window ▸** [each other window ▸ its tabs…, New Tab], **Send to New Window**. It's a real move: the pane keeps its id, so its process (shell, ssh, tmux) keeps running untouched. Nothing reconnects. A tab emptied by a move closes (and so does its window, if it was the last tab).
+- **Session Restore.** A pane that has run `ssh` shows a link button in its header. Pick the host (aliases like `macstudio` are expanded) and one of that host's live tmux sessions, then **Remember**. From then on every fresh shell in that pane (app launch, Cmd-Q and relaunch, Enter after a dropped connection) runs `ssh -t <host> … tmux new-session -A -s <session>` and attaches or creates it. **Reconnect now** / **Forget** live in the same popover.
+- **Clone Workspace to another Mac.** Right-click a tab: **Clone Workspace to ▸** [your other Macs online in Tailscale], **Copy Workspace Snapshot**, **Open Workspace from Clipboard**. The snapshot carries the window's tabs, the exact split layout and sizes, and each pane's settings. It's delivered over ssh into Terminus's `workspace-inbox` on the other Mac, which asks "Open workspace from …?" (also at launch, if it arrived while Terminus was closed). Remembered sessions reconnect; a session hosted on the receiving Mac attaches locally.
+  - On recent macOS, Terminus's own `ssh` needs the **Local Network** permission once per Mac; the prompt names "ssh-keygen wrapper".
+  - Sending uses key-based ssh between your Macs (Tailscale names), with the ssh user taken from your remembered sessions.
+
+### Reliability
+
+- **No more mouse floods.** When tmux/ssh dies with mouse reporting on, Terminus resets stale terminal modes when the shell prompt returns, when a pane's process starts or stops, and after history replay, so scrolls are no longer typed into zsh as escape codes.
+- Agent panes attach-or-create their tmux session (`new-session -A`); a dead session leaves the pane "done", and Enter re-attaches.
+- Hardened after a full code review (Fable 5.1 + Opus 5.5 verification, [docs/REVIEW-2026-09-26.md](docs/REVIEW-2026-09-26.md)): shell quoting everywhere (`frontend/util/shellquote.ts`), web blocks can't capture screen/audio, cloud sync is allowlisted and never uploads secrets, Dev Servers only kills the process it shows, and more.
+- **Privacy:** no telemetry or pings to Wave's servers; auto-update is off (there is no Terminus update feed).
 
 ### Panels
 
@@ -68,7 +85,7 @@ To enable cloud sync:
    - **Cloud OAuth Client Secret** — Google OAuth client secret
 4. Sign in via the Cloud Sync section in Settings
 
-Machine-specific paths (repo base, agents path) are intentionally excluded from sync.
+Machine-specific paths (repo base, agents path) are intentionally excluded from sync. Only `settings`, `connections` and `widgets` are synced (allowlisted on both push and pull); secret-looking keys (`*apitoken*`, `*secret*`, `*password*`, …) are stripped before upload and kept locally on pull; a startup pull never overwrites a local file that is newer than the cloud copy.
 
 ---
 
@@ -108,7 +125,7 @@ npm run build:prod
 npm exec electron-builder -- -c electron-builder.config.cjs -p never
 ```
 
-Output: `make/Terminus-darwin-arm64-0.14.1.dmg` and `make/Terminus-darwin-x64-0.14.1.dmg`
+Output: `make/Terminus-darwin-{arm64,x64}-<version>.{dmg,zip}` (ad-hoc signed, not notarized). Set `CSC_IDENTITY_AUTO_DISCOVERY=false` to skip certificate lookup, and never use `task package` (see BUILD.md). Releases are tagged `terminus-v<version>`, because the upstream `v0.14.x` tags also exist in this repo.
 
 ---
 
@@ -127,6 +144,11 @@ Output: `make/Terminus-darwin-arm64-0.14.1.dmg` and `make/Terminus-darwin-x64-0.
 | `pkg/wconfig/defaultconfig/widgets.json` | Sidebar widget definitions |
 | `emain/emain-ipc.ts` | Electron IPC handlers |
 | `emain/emain-oauth.ts` | Cloud sync OAuth + BYOE endpoint config |
+| `frontend/util/shellquote.ts` | Shell quoting (`shellQuote`, `sshCommand`, safe session names), tested against /bin/sh |
+| `frontend/app/view/term/termwrap.ts`, `osc-handlers.ts` | Stale mouse/terminal mode resets (mouse-flood fix) |
+| `frontend/app/block/blockmove.ts`, `pkg/wcore/blockmove.go` | Send pane to tab/window (non-destructive `detach` layout action) |
+| `frontend/app/block/sessionrestore*.ts`, `sessionbutton.tsx` | Session Restore |
+| `frontend/app/workspace/workspaceclone*.ts`, `pkg/wcore/workspaceimport.go`, `emain/emain-workspaceinbox.ts` | Clone Workspace (snapshot, send, inbox, import) |
 
 ---
 
@@ -134,7 +156,7 @@ Output: `make/Terminus-darwin-arm64-0.14.1.dmg` and `make/Terminus-darwin-x64-0.
 
 Terminus is forked from [Wave Terminal](https://github.com/wavetermdev/waveterm), an open-source terminal for macOS, Linux, and Windows. All upstream features — SSH sessions, file preview, drag-and-drop blocks, `wsh` CLI — are preserved.
 
-Forked at Wave v0.14.1-beta.0. Last synced: v0.14.1.
+Forked at Wave v0.14.1-beta.0. Last synced: v0.14.1. As of 2026-09-26 upstream is at v0.14.5 plus 63 unreleased commits (197 ahead of the fork; a trial merge shows 25 conflicting files). The catch-up is planned; see [ROADMAP.md](ROADMAP.md).
 
 ---
 
