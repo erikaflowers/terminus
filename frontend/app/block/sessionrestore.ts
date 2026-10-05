@@ -10,7 +10,7 @@
 // Older builds wrote an auto-reconnect init script (`exec … tmux new-session -A`); migrateLegacyPane
 // turns those into a remembered session before the pane's shell first starts.
 
-import { getRemoteConfig } from "@/app/store/agents";
+import { getRemoteConfig, globalConfigAtom } from "@/app/store/agents";
 import { getApi, getBlockComponentModel, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
 import { RpcApi } from "@/app/store/wshclientapi";
@@ -74,6 +74,11 @@ export function hostDisplayName(host: string): string {
 /** Where the sessions live: Crew's remote host, else this machine. */
 export function getHomeHost(): string {
     return getRemoteConfig()?.remoteHost || LocalHost;
+}
+
+/** Same, reactive: re-renders when Crew's settings load or change. */
+export function useHomeHost(): string {
+    return jotai.useAtomValue(globalConfigAtom)?.remoteHost || LocalHost;
 }
 
 /** Called for every command the pane's shell starts (typed line, and the alias-expanded line if different). */

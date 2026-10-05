@@ -7,7 +7,7 @@
 import { useAtomValue } from "jotai";
 import * as React from "react";
 import { PickSessionButton } from "./sessionbar";
-import { getAttachedAtom, getHomeHost, hostDisplayName } from "./sessionrestore";
+import { getAttachedAtom, hostDisplayName, useHomeHost } from "./sessionrestore";
 
 type SessionButtonProps = {
     blockId: string;
@@ -17,7 +17,7 @@ type SessionButtonProps = {
 
 export const SessionButton = React.memo(({ blockId, savedHost, savedSession }: SessionButtonProps) => {
     const attached = useAtomValue(getAttachedAtom(blockId));
-    const home = getHomeHost();
+    const home = useHomeHost();
     const title = attached
         ? `Attached: ${attached.session} @ ${hostDisplayName(attached.host)}`
         : savedSession

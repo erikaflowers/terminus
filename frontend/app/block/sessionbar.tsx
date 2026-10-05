@@ -14,7 +14,7 @@ import {
     forgetSession,
     getAttachedAtom,
     getAttachErrorAtom,
-    getHomeHost,
+    useHomeHost,
     hostDisplayName,
     launchAgentAtHome,
     listSessions,
@@ -167,7 +167,7 @@ export const SessionBar = ({ blockId }: { blockId: string }) => {
 
     React.useEffect(() => setLocalError(null), [host, session, attached]);
 
-    const home = getHomeHost();
+    const home = useHomeHost();
     if (attached != null || block?.meta?.["session:off"] || block?.meta?.view !== "term") {
         return null;
     }
