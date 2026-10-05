@@ -158,21 +158,23 @@ export function resetPaneState(blockId: string) {
     }
 }
 
-/** Wait until the pane's shell is at its prompt (a fresh pane needs a moment to start). */
+/**
+ * Is it safe to type at this pane? Waits briefly for its prompt. Refuses only when a command is
+ * visibly running; without shell integration (e.g. Terminus started inside tmux) the state is
+ * unknown, and typing into a shell that's still starting is fine (the tty buffers it).
+ */
 async function waitForPrompt(blockId: string, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
+    let status: ShellIntegrationStatus | null = null;
     while (Date.now() < deadline) {
         const a = shellStatusAtom(blockId);
-        const status = a ? globalStore.get(a) : null;
+        status = a ? globalStore.get(a) : null;
         if (status === "ready") {
             return true;
         }
-        if (status === "running-command") {
-            return false;
-        }
         await new Promise((r) => setTimeout(r, 150));
     }
-    return false;
+    return status !== "running-command";
 }
 
 /**
@@ -187,7 +189,7 @@ export async function attachPane(blockId: string, host: string, session: string)
     if (globalStore.get(getAttachedAtom(blockId)) != null) {
         return "This pane is already attached. Detach first (Ctrl-b d).";
     }
-    if (!(await waitForPrompt(blockId, 10000))) {
+    if (!(await waitForPrompt(blockId, 3000))) {
         return "This pane is busy. Finish what's running, then attach.";
     }
     await rememberSession(blockId, { host, session });
