@@ -1,10 +1,13 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Pure helpers for Session Restore: recognise an ssh command line, and build the command that
-// brings a pane back to "ssh <host> → tmux <session>" (attach-or-create).
+// Pure helpers for home sessions: recognise an ssh/tmux command line, build the attach command a
+// pane runs when you pick a session, and read the old auto-reconnect init scripts (for migration).
 
-import { isSafeSessionName, shellQuote, sshCommand } from "@/util/shellquote";
+import { isSafeSessionName, shellJoin, shellQuote, sshCommand } from "@/util/shellquote";
+
+/** session:host value for a tmux session on this machine (no ssh). */
+export const LocalHost = "local";
 
 // ssh options that take a value (from ssh(1)); anything else starting with "-" is a flag
 const SshOptsWithArg = new Set("BbcDEeFIiJLlmOoPpQRSWw".split("").map((c) => "-" + c));
@@ -99,7 +102,7 @@ export function parseSshCommand(cmdline: string): SshTarget | null {
         if (["attach", "attach-session", "a", "at", "new", "new-session"].includes(sub)) {
             const flag = sub.startsWith("new") ? "-s" : "-t";
             const k = rest.indexOf(flag);
-            const name = k >= 0 ? rest[k + 1] : undefined;
+            const name = k >= 0 ? rest[k + 1]?.replace(/^=/, "") : undefined;
             if (name && isSafeSessionName(name)) {
                 target.tmuxSession = name;
             }
@@ -108,14 +111,77 @@ export function parseSshCommand(cmdline: string): SshTarget | null {
     return target;
 }
 
-/** Init script (cmd:initscript.zsh) that connects to `host` and attaches to (or creates) `session`. */
-export function buildSessionRestoreScript(host: string, session: string): string | null {
-    if (!parseSshCommand("ssh " + shellQuote(host)) || !isSafeSessionName(session)) {
+/** A local `tmux attach -t <name>` typed in a pane (no ssh): the session name, or null. */
+export function parseLocalTmuxAttach(cmdline: string): string | null {
+    const words = splitShellWords((cmdline ?? "").trim()).filter((w) => w !== "exec" && w !== "command");
+    if (words.length < 2 || !(words[0] === "tmux" || words[0].endsWith("/tmux"))) {
         return null;
     }
-    const remote = ["sh", "-c", `PATH="$PATH:${RemotePath}"; exec tmux new-session -A -s "$1"`, "sh", session];
-    // exec: when the connection drops the pane shows "done" and Enter reconnects
-    return `exec ${sshCommand(host, remote, { tty: true })}\n`;
+    if (!["attach", "attach-session", "a", "at"].includes(words[1])) {
+        return null;
+    }
+    const k = words.indexOf("-t");
+    const name = k >= 0 ? words[k + 1]?.replace(/^=/, "") : undefined;
+    return name && isSafeSessionName(name) ? name : null;
+}
+
+/**
+ * The command a pane runs (typed at its prompt) to attach to an EXISTING tmux session: never
+ * creates one, and no `exec`, so detaching or a dropped connection lands back in the pane's own
+ * shell. `=` makes tmux match the name exactly ("lee" never attaches "lee-identity").
+ */
+export function buildAttachCommand(host: string, session: string): string | null {
+    if (!isSafeSessionName(session)) {
+        return null;
+    }
+    if (!host || host === LocalHost) {
+        return shellJoin(["tmux", "attach-session", "-t", "=" + session]);
+    }
+    if (!parseSshCommand("ssh " + shellQuote(host))) {
+        return null;
+    }
+    const remote = ["sh", "-c", `PATH="$PATH:${RemotePath}"; exec tmux attach-session -t "=$1"`, "sh", session];
+    return sshCommand(host, remote, { tty: true });
+}
+
+/**
+ * Read an old auto-reconnect init script (any of the `exec … tmux new-session -A -s <name>` forms
+ * Session Restore, Crew, the agent picker, Detach and Clone Workspace used to write) and return what
+ * it connected to, so the pane can offer it instead of running it. Null for anything else.
+ */
+export function parseLegacyInitScript(script: string): { host: string; session: string } | null {
+    if (!script || !script.includes("new-session")) {
+        return null;
+    }
+    const line = script.trim().split("\n")[0];
+    const local = splitShellWords(line).filter((w) => w !== "exec");
+    // attach-or-create is "new-session -A"; check parsed words (it's quoted in the scripts, and
+    // ssh has its own unrelated -A)
+    const isAttachOrCreate = (words: string[]) => {
+        const k = words.findIndex((w) => w === "tmux" || w.endsWith("/tmux"));
+        return k >= 0 && words[k + 1] === "new-session" && words.slice(k + 2).includes("-A");
+    };
+    const ssh = parseSshCommand(line);
+    if (ssh) {
+        const remote = splitShellWords(local[local.length - 1] ?? "");
+        if (isAttachOrCreate(remote) && ssh.tmuxSession) {
+            return { host: ssh.host, session: ssh.tmuxSession };
+        }
+        // Session Restore form: ssh -t host 'sh -c "… exec tmux new-session -A -s \"$1\"" sh <name>'
+        // splitShellWords stops at ";", so read the last statement of the -c script ("exec tmux …")
+        const inner = remote[0] === "sh" && remote[1] === "-c" ? splitShellWords((remote[2] ?? "").split(";").pop()) : [];
+        const name = remote[remote.length - 1];
+        if (isAttachOrCreate(inner) && remote.length === 5 && isSafeSessionName(name)) {
+            return { host: ssh.host, session: name };
+        }
+        return null;
+    }
+    if (!isAttachOrCreate(local)) {
+        return null;
+    }
+    const k = local.indexOf("-s");
+    const name = k >= 0 ? local[k + 1] : undefined;
+    return name && isSafeSessionName(name) ? { host: LocalHost, session: name } : null;
 }
 
 /**

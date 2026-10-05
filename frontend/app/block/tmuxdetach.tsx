@@ -1,11 +1,9 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { buildTmuxAttachInitScript } from "@/app/store/agents";
-import { atoms, WOS } from "@/app/store/global";
-import { globalStore } from "@/app/store/jotaiStore";
-import { RpcApi } from "@/app/store/wshclientapi";
-import { TabRpcClient } from "@/app/store/wshrpcutil";
+import { attachPane, getHomeHost } from "@/app/block/sessionrestore";
+import { buildTmuxCommand } from "@/app/store/agents";
+import { getApi } from "@/app/store/global";
 import { Popover, PopoverButton, PopoverContent } from "@/element/popover";
 import * as React from "react";
 
@@ -38,23 +36,21 @@ export const TmuxDetachButton = React.memo(({ blockId, cwd }: TmuxDetachButtonPr
         setSessionName(getDefaultSessionName(cwd));
     }, [cwd]);
 
+    const [error, setError] = React.useState<string>(null);
+
+    // Start a tmux session where sessions live (in this pane's directory), then attach this pane to
+    // it by typing at the prompt. Detaching later leaves this pane's own shell; nothing auto-reconnects.
     const handleDetach = React.useCallback(async () => {
         const name = sanitizeSessionName(sessionName);
-        const initScript = buildTmuxAttachInitScript(name, cwd);
-        if (!initScript) return;
-
-        const tabId = globalStore.get(atoms.staticTabId);
-
-        await RpcApi.SetMetaCommand(TabRpcClient, {
-            oref: WOS.makeORef("block", blockId),
-            meta: { "cmd:initscript.zsh": initScript },
-        });
-
-        await RpcApi.ControllerResyncCommand(TabRpcClient, {
-            tabid: tabId,
-            blockid: blockId,
-            forcerestart: true,
-        });
+        const args = ["new-session", "-d", "-s", name];
+        if (cwd) args.push("-c", cwd);
+        const result = await getApi().execCommand(buildTmuxCommand(args));
+        if (result.code !== 0) {
+            setError(`Couldn't create "${name}" (it may already exist).`);
+            return;
+        }
+        const err = await attachPane(blockId, getHomeHost(), name);
+        setError(err);
     }, [blockId, sessionName, cwd]);
 
     const handleKeyDown = React.useCallback(
@@ -129,6 +125,7 @@ export const TmuxDetachButton = React.memo(({ blockId, cwd }: TmuxDetachButtonPr
                             {cwd}
                         </div>
                     )}
+                    {error && <div style={{ color: "var(--warning-color, #e5b567)", fontSize: 11 }}>{error}</div>}
                     <div style={{ display: "flex", justifyContent: "flex-end" }}>
                         <button
                             onClick={handleDetach}

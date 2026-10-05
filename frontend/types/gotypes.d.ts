@@ -1147,6 +1147,7 @@ declare global {
         "session:*"?: boolean;
         "session:host"?: string;
         "session:tmux"?: string;
+        "session:off"?: boolean;
         "web:zoom"?: number;
         "web:hidenav"?: boolean;
         "web:partition"?: string;

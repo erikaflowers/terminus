@@ -155,8 +155,9 @@ type MetaTSType struct {
 	AgentRole  string `json:"agent:role,omitempty"`  // terminus
 
 	SessionClear bool   `json:"session:*,omitempty"`
-	SessionHost  string `json:"session:host,omitempty"` // terminus session restore: ssh destination (e.g. user@host)
-	SessionTmux  string `json:"session:tmux,omitempty"` // terminus session restore: tmux session to attach/create
+	SessionHost  string `json:"session:host,omitempty"` // terminus home sessions: ssh destination (e.g. user@host), or "local"
+	SessionTmux  string `json:"session:tmux,omitempty"` // terminus home sessions: tmux session this pane offers to attach
+	SessionOff   bool   `json:"session:off,omitempty"`  // terminus home sessions: pane dismissed the session bar
 
 	WebZoom          float64 `json:"web:zoom,omitempty"`
 	WebHideNav       *bool   `json:"web:hidenav,omitempty"`

@@ -152,11 +152,14 @@ export async function readWorkspaceSnapshotFromClipboard(): Promise<WorkspaceSna
 /** Open a snapshot here, as a new window, with sessions adapted to this machine. */
 export async function openWorkspaceSnapshot(snap: WorkspaceSnapshot): Promise<void> {
     const local = await localMachineNames();
+    // ssh destination for the sender's own ("local") sessions: reuse a user@ seen for that machine
+    const knownHosts = snap.tabs.flatMap((t) => t.blocks.map((b) => b.meta?.["session:host"]).filter(Boolean));
+    const sender = snap.from ? sshTargetFor({ label: snap.from, hostName: snap.from, os: "", online: true }, knownHosts) : null;
     const adapted = {
         ...snap,
         tabs: snap.tabs.map((t) => ({
             ...t,
-            blocks: t.blocks.map((b) => ({ meta: adaptPaneMetaForHere(b.meta ?? {}, local) })),
+            blocks: t.blocks.map((b) => ({ meta: adaptPaneMetaForHere(b.meta ?? {}, local, sender) })),
         })),
     };
     await services.WindowService.OpenWorkspaceSnapshot(JSON.stringify(adapted));

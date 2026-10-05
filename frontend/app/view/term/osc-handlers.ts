@@ -1,7 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { noteShellCommand } from "@/app/block/sessionrestore";
+import { noteCommandDone, notePrompt, noteShellCommand } from "@/app/block/sessionrestore";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
 import {
@@ -294,6 +294,7 @@ export function handleOsc16162Command(data: string, blockId: string, loaded: boo
         case "A": {
             rtInfo["shell:state"] = "ready";
             globalStore.set(termWrap.shellIntegrationStatusAtom, "ready");
+            notePrompt(blockId); // back at the pane's own prompt: any attached session has detached
             // The shell is drawing its prompt, so whatever ran in the foreground has exited. If that was
             // ssh/tmux and the connection dropped, the "mouse off" never arrived; the shell itself never
             // turns mouse reporting on, so any mode still set here is stale (else scrolls flood the prompt).
@@ -337,6 +338,7 @@ export function handleOsc16162Command(data: string, blockId: string, loaded: boo
         case "D":
             if (cmd.data.exitcode != null) {
                 rtInfo["shell:lastcmdexitcode"] = cmd.data.exitcode;
+                noteCommandDone(blockId, cmd.data.exitcode);
             } else {
                 rtInfo["shell:lastcmdexitcode"] = null;
             }

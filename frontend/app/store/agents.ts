@@ -1,6 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import { attachPane, getHomeHost, resetPaneState } from "@/app/block/sessionrestore";
 import { atoms, getApi, WOS } from "@/app/store/global";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
@@ -470,25 +471,6 @@ function buildTmuxCommand(args: string[], opts?: { tty?: boolean }): string {
     return shellJoin([tmux, ...args]);
 }
 
-/**
- * Init script (cmd:initscript.zsh) that attaches to a tmux session, creating it if it's missing
- * (`new-session -A`). `exec` replaces the pane's shell, so when tmux/ssh exits (detach, dropped
- * connection, dead session) the pane shows the process as done and Enter replays this script to
- * re-attach, instead of leaving a plain local shell under the agent's header.
- * Returns null (and warns) if the session name isn't safe.
- */
-function buildTmuxAttachInitScript(sessionName: string, cwd?: string): string | null {
-    if (!isSafeSessionName(sessionName)) {
-        console.warn("[tmux] refusing unsafe session name", JSON.stringify(sessionName));
-        return null;
-    }
-    const args = ["new-session", "-A", "-s", sessionName];
-    if (cwd) {
-        args.push("-c", cwd);
-    }
-    return `exec ${buildTmuxCommand(args, { tty: true })}\n`;
-}
-
 /** Directory an agent's tmux session starts in (same as Crew's spawn), or "" if agentsPath isn't set. */
 function getAgentDir(agentKey: string): string {
     const agentsDir = getAgentsPath();
@@ -497,34 +479,41 @@ function getAgentDir(agentKey: string): string {
 
 // --- Tmux Session Switching via ForceRestart ---
 
+/**
+ * Point a pane at an agent (or at nothing): restart it as a clean local shell that remembers the
+ * agent's session where sessions live, then attach by typing at its prompt. Detaching leaves the
+ * local shell; nothing reconnects on its own (see block/sessionrestore.ts).
+ */
 async function forceRestartWithAgent(blockId: string, agentName: string | null): Promise<void> {
     const tabId = globalStore.get(atoms.staticTabId);
-
-    let initScript: string | null = null;
-    if (agentName) {
-        const session = agentName.toLowerCase();
-        initScript = buildTmuxAttachInitScript(session, getAgentDir(session));
-        if (initScript == null) {
-            return;
-        }
+    const session = agentName ? agentName.toLowerCase() : null;
+    if (session && !isSafeSessionName(session)) {
+        return;
     }
-
+    const home = getHomeHost();
     await RpcApi.SetMetaCommand(TabRpcClient, {
         oref: WOS.makeORef("block", blockId),
-        meta: { "cmd:initscript.zsh": initScript },
+        meta: {
+            "cmd:initscript.zsh": null,
+            "session:host": session ? home : null,
+            "session:tmux": session,
+            "session:off": null,
+        },
     });
-
+    resetPaneState(blockId);
     await RpcApi.ControllerResyncCommand(TabRpcClient, {
         tabid: tabId,
         blockid: blockId,
         forcerestart: true,
     });
+    if (session) {
+        await attachPane(blockId, home, session);
+    }
 }
 
 export {
     AgentColorTable,
     agentsAtom,
-    buildTmuxAttachInitScript,
     buildTmuxCommand,
     forceRestartWithAgent,
     getAgentColor,

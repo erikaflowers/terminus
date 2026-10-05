@@ -3,9 +3,13 @@ import { mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
+import { shellJoin, sshCommand } from "@/util/shellquote";
 import {
+    buildAttachCommand,
     buildListSessionsCommand,
-    buildSessionRestoreScript,
+    LocalHost,
+    parseLegacyInitScript,
+    parseLocalTmuxAttach,
     parseSessionList,
     parseSshCommand,
 } from "./sessionrestore-util";
@@ -55,18 +59,62 @@ function runWithFakeSsh(script: string): string {
     return execFileSync("/bin/zsh", ["-fc", fake + script.replace(/^exec /, "")], { encoding: "utf8" });
 }
 
-describe("buildSessionRestoreScript", () => {
-    it("reaches the remote tmux with the exact session name, through both shells", () => {
-        const script = buildSessionRestoreScript("erikflowers@mac-studio-2", "siddig");
-        expect(script.startsWith("exec ssh -t ")).toBe(true);
-        expect(runWithFakeSsh(script)).toBe("HOST=erikflowers@mac-studio-2\nTMUX:new-session|-A|-s|siddig|\n");
+describe("buildAttachCommand", () => {
+    it("attaches (never creates) the exact remote session, through both shells, with no exec", () => {
+        const cmd = buildAttachCommand("erikflowers@mac-studio-2", "siddig");
+        expect(cmd.startsWith("ssh -t ")).toBe(true);
+        expect(cmd).not.toContain("new-session");
+        expect(runWithFakeSsh(cmd)).toBe("HOST=erikflowers@mac-studio-2\nTMUX:attach-session|-t|=siddig|\n");
+    });
+    it("attaches locally without ssh", () => {
+        expect(buildAttachCommand(LocalHost, "lee")).toBe("'tmux' 'attach-session' '-t' '=lee'");
+        expect(buildAttachCommand("", "lee")).toBe("'tmux' 'attach-session' '-t' '=lee'");
     });
     it("refuses unsafe names and hosts", () => {
-        expect(buildSessionRestoreScript("host", "a;b")).toBeNull();
-        expect(buildSessionRestoreScript("host", "$(id)")).toBeNull();
-        expect(buildSessionRestoreScript("ho st", "lee")).toBeNull();
-        expect(buildSessionRestoreScript("h;x", "lee")).toBeNull();
+        expect(buildAttachCommand("host", "a;b")).toBeNull();
+        expect(buildAttachCommand("host", "$(id)")).toBeNull();
+        expect(buildAttachCommand("ho st", "lee")).toBeNull();
+        expect(buildAttachCommand("h;x", "lee")).toBeNull();
     });
+});
+
+describe("parseLocalTmuxAttach", () => {
+    it("reads a typed local attach", () => {
+        expect(parseLocalTmuxAttach("tmux attach -t heavy")).toBe("heavy");
+        expect(parseLocalTmuxAttach("tmux a -t =lee")).toBe("lee");
+        expect(parseLocalTmuxAttach(buildAttachCommand(LocalHost, "siddig"))).toBe("siddig");
+    });
+    it("ignores everything else", () => {
+        for (const c of ["tmux new -s x", "tmux ls", "ls", "", "tmux attach -t 'a;b'"]) {
+            expect(parseLocalTmuxAttach(c)).toBeNull();
+        }
+    });
+});
+
+// The exact init scripts older builds wrote (same helpers, same arguments as the removed builders).
+const RemotePath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+const legacy = {
+    sessionRestore: `exec ${sshCommand("erikflowers@mac-studio-2", ["sh", "-c", `PATH="$PATH:${RemotePath}"; exec tmux new-session -A -s "$1"`, "sh", "siddig"], { tty: true })}\n`,
+    crewRemote: `exec ${sshCommand("juliansiddig@julians-mac-mini", ["/opt/homebrew/bin/tmux", "new-session", "-A", "-s", "lee", "-c", "/Users/x/claude projects/matilda/agent-lee"], { tty: true })}\n`,
+    crewLocal: `exec ${shellJoin(["/opt/homebrew/bin/tmux", "new-session", "-A", "-s", "heavy", "-c", "/Users/x/agent-heavy"])}\n`,
+    cloneLocal: `exec ${shellJoin(["tmux", "new-session", "-A", "-s", "renner"])}\n`,
+};
+
+describe("parseLegacyInitScript", () => {
+    it("reads every old auto-reconnect form", () => {
+        expect(parseLegacyInitScript(legacy.sessionRestore)).toEqual({ host: "erikflowers@mac-studio-2", session: "siddig" });
+        expect(parseLegacyInitScript(legacy.crewRemote)).toEqual({ host: "juliansiddig@julians-mac-mini", session: "lee" });
+        expect(parseLegacyInitScript(legacy.crewLocal)).toEqual({ host: LocalHost, session: "heavy" });
+        expect(parseLegacyInitScript(legacy.cloneLocal)).toEqual({ host: LocalHost, session: "renner" });
+    });
+    it("leaves other init scripts alone", () => {
+        for (const c of [null, "", "echo hi\n", "cd ~/x && npm run dev\n", "exec tmux attach -t lee\n", "tmux new -s x\n"]) {
+            expect(parseLegacyInitScript(c)).toBeNull();
+        }
+    });
+});
+
+describe("session lists", () => {
     it("list command is non-interactive", () => {
         const cmd = buildListSessionsCommand("mini");
         expect(cmd).toContain("'BatchMode=yes'");
@@ -94,6 +142,9 @@ describe("buildSessionRestoreScript", () => {
                 { name: "siddig", attached: 0 },
             ]);
             expect(buildListSessionsCommand("h")).toContain("#{session_name}|#{session_attached}");
+            // "=" matches exactly: with only "lee_2" running, "=lee" must not find it
+            tmux("has-session -t =lee_2");
+            expect(() => tmux("has-session -t =lee 2>/dev/null")).toThrow();
         } finally {
             try {
                 tmux("kill-server");

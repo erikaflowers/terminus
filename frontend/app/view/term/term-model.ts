@@ -43,6 +43,15 @@ import { getBlockingCommand } from "./shellblocking";
 import { computeTheme, DefaultTermTheme } from "./termutil";
 import { MouseReportRegex, TermWrap } from "./termwrap";
 
+/** A split starts as a fresh pane: same look, but no remembered session (it offers the picker). */
+function splitPaneMeta(meta: MetaType): MetaType {
+    if (meta == null) {
+        return null;
+    }
+    const { "session:host": _h, "session:tmux": _t, "session:off": _o, ...rest } = meta;
+    return rest;
+}
+
 export class TermViewModel implements ViewModel {
     viewType: string;
     nodeModel: BlockNodeModel;
@@ -983,7 +992,7 @@ export class TermViewModel implements ViewModel {
             click: () => {
                 const blockData = globalStore.get(this.blockAtom);
                 const blockDef: BlockDef = {
-                    meta: blockData?.meta || defaultTermBlockDef.meta,
+                    meta: splitPaneMeta(blockData?.meta) || defaultTermBlockDef.meta,
                 };
                 createBlockSplitHorizontally(blockDef, this.blockId, "after");
             },
@@ -993,7 +1002,7 @@ export class TermViewModel implements ViewModel {
             click: () => {
                 const blockData = globalStore.get(this.blockAtom);
                 const blockDef: BlockDef = {
-                    meta: blockData?.meta || defaultTermBlockDef.meta,
+                    meta: splitPaneMeta(blockData?.meta) || defaultTermBlockDef.meta,
                 };
                 createBlockSplitVertically(blockDef, this.blockId, "after");
             },
