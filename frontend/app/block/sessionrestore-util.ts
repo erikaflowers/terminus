@@ -209,3 +209,13 @@ export function parseSessionList(stdout: string): { name: string; attached: numb
     }
     return rtn;
 }
+
+/** "New Site!" → "new-site": what `launch <agent> <project>` accepts as a session suffix. */
+export function normalizeProjectName(raw: string): string {
+    return (raw ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40);
+}

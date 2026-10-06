@@ -20,6 +20,7 @@ import {
     launchAndAttach,
     listAgentsAtHome,
     listSessions,
+    normalizeProjectName,
     RemoteSession,
 } from "./sessionrestore";
 import { LocalHost } from "./sessionrestore-util";
@@ -55,7 +56,7 @@ type SessionPickerProps = {
     host: string;
     current?: string;
     onPick: (session: string) => void;
-    onNew?: (agent: string) => Promise<void>;
+    onNew?: (agent: string, project?: string) => Promise<void>;
 };
 
 const sectionLabel: React.CSSProperties = {
@@ -73,6 +74,18 @@ export const SessionPicker = ({ host, current, onPick, onNew }: SessionPickerPro
     const [sessions, setSessions] = React.useState<RemoteSession[] | null | undefined>(undefined);
     const [agents, setAgents] = React.useState<string[] | null>(null);
     const [starting, setStarting] = React.useState<string>(null);
+    const [copyFor, setCopyFor] = React.useState<string>(null);
+    const [copyName, setCopyName] = React.useState("");
+    const isAgent = (name: string) => (agents ?? []).includes(name);
+    const startCopy = async () => {
+        const project = normalizeProjectName(copyName);
+        if (!copyFor || !project) return;
+        setStarting(`${copyFor}-${project}`);
+        await onNew(copyFor, project);
+        setStarting(null);
+        setCopyFor(null);
+        setCopyName("");
+    };
     const refresh = React.useCallback(() => {
         setSessions(undefined);
         listSessions(host).then(setSessions);
@@ -145,25 +158,80 @@ export const SessionPicker = ({ host, current, onPick, onNew }: SessionPickerPro
                 <span style={{ color: "var(--grey-text-color)", fontSize: 11 }}>No tmux sessions running.</span>
             )}
             {sessions?.map((s) => (
-                <button
-                    key={s.name}
-                    onClick={() => onPick(s.name)}
-                    title={s.attached > 0 ? `${s.attached} client(s) attached` : "nobody attached"}
-                    style={{
-                        ...sessionButtonStyle(false),
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "5px 8px",
-                        textAlign: "left",
-                        fontFamily: "monospace",
-                        outline: s.name === current ? "1px solid var(--accent-color)" : "none",
-                    }}
-                >
-                    <AgentDot name={s.name} attached={s.attached > 0} />
-                    <span style={{ flexGrow: 1 }}>{s.name}</span>
-                    {s.attached > 0 && <span style={{ color: "var(--grey-text-color)", fontSize: 10 }}>{s.attached}</span>}
-                </button>
+                <React.Fragment key={s.name}>
+                    <div style={{ display: "flex", gap: 4 }}>
+                        <button
+                            onClick={() => onPick(s.name)}
+                            title={s.attached > 0 ? `${s.attached} client(s) attached` : "nobody attached"}
+                            style={{
+                                ...sessionButtonStyle(false),
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                padding: "5px 8px",
+                                textAlign: "left",
+                                fontFamily: "monospace",
+                                flexGrow: 1,
+                                outline: s.name === current ? "1px solid var(--accent-color)" : "none",
+                            }}
+                        >
+                            <AgentDot name={s.name.split("-")[0]} attached={s.attached > 0} />
+                            <span style={{ flexGrow: 1 }}>{s.name}</span>
+                            {s.attached > 0 && (
+                                <span style={{ color: "var(--grey-text-color)", fontSize: 10 }}>{s.attached}</span>
+                            )}
+                        </button>
+                        {onNew && isAgent(s.name) && (
+                            <button
+                                title={`Second copy: launch ${s.name} <project>`}
+                                onClick={() => {
+                                    setCopyFor(copyFor === s.name ? null : s.name);
+                                    setCopyName("");
+                                }}
+                                style={{ ...sessionButtonStyle(copyFor === s.name), padding: "0 8px" }}
+                            >
+                                +
+                            </button>
+                        )}
+                    </div>
+                    {copyFor === s.name && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 4, paddingLeft: 8 }}>
+                            <span style={{ fontFamily: "monospace", fontSize: 12, color: "var(--grey-text-color)" }}>
+                                {s.name}-
+                            </span>
+                            <input
+                                autoFocus
+                                value={copyName}
+                                placeholder="project"
+                                disabled={!!starting}
+                                onChange={(e) => setCopyName(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if (e.key === "Enter") startCopy();
+                                    if (e.key === "Escape") setCopyFor(null);
+                                }}
+                                style={{
+                                    flexGrow: 1,
+                                    minWidth: 0,
+                                    background: "rgba(255,255,255,0.08)",
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    borderRadius: 4,
+                                    color: "var(--main-text-color)",
+                                    padding: "3px 6px",
+                                    fontSize: 12,
+                                    fontFamily: "monospace",
+                                    outline: "none",
+                                }}
+                            />
+                            <button
+                                style={sessionButtonStyle(true)}
+                                disabled={!normalizeProjectName(copyName) || !!starting}
+                                onClick={startCopy}
+                            >
+                                {starting ? "starting…" : "Launch"}
+                            </button>
+                        </div>
+                    )}
+                </React.Fragment>
             ))}
         </div>
     );
@@ -190,7 +258,7 @@ export const PickSessionButton = ({
         setGen((g) => g + 1);
     };
     const onNew = React.useCallback(
-        async (agent: string) => done(await launchAndAttach(blockId, host, agent)),
+        async (agent: string, project?: string) => done(await launchAndAttach(blockId, host, agent, project)),
         [blockId, host]
     );
     return (

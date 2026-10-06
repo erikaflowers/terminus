@@ -8,6 +8,7 @@ import {
     buildAttachCommand,
     buildListSessionsCommand,
     LocalHost,
+    normalizeProjectName,
     parseLegacyInitScript,
     parseLocalTmuxAttach,
     parseSessionList,
@@ -150,5 +151,14 @@ describe("session lists", () => {
                 tmux("kill-server");
             } catch {}
         }
+    });
+});
+
+describe("normalizeProjectName", () => {
+    it("makes a safe session suffix", () => {
+        expect(normalizeProjectName("newsite")).toBe("newsite");
+        expect(normalizeProjectName("  New Site! ")).toBe("new-site");
+        expect(normalizeProjectName("a;b $(id)")).toBe("a-b-id");
+        expect(normalizeProjectName("---")).toBe("");
     });
 });

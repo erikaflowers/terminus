@@ -23,12 +23,15 @@ import {
     buildAttachCommand,
     buildListSessionsCommand,
     LocalHost,
+    normalizeProjectName,
     parseLegacyInitScript,
     parseLocalTmuxAttach,
     parseSessionList,
     parseSshCommand,
     SshTarget,
 } from "./sessionrestore-util";
+
+export { normalizeProjectName };
 
 export type SessionTarget = { host: string; session: string };
 export type RemoteSession = { name: string; attached: number };
@@ -252,29 +255,31 @@ export async function migrateLegacyPane(blockId: string): Promise<void> {
 }
 
 /**
- * Start an agent's session where the sessions live, the way `launch <agent>` does on the Mini:
- * a detached tmux session in that machine's agent folder running `clauded`. Returns null on
- * success, else why not. Does nothing if the session already exists.
+ * Start an agent's session where the sessions live, the way `launch <agent> [project]` does on the
+ * Mini: a detached tmux session (`<agent>`, or `<agent>-<project>` for a second copy) in that
+ * machine's agent folder, running `clauded`. Returns null on success, else why not. Does nothing
+ * if the session already exists.
  */
-export async function launchAgentAtHome(host: string, agent: string): Promise<string | null> {
-    if (!isSafeSessionName(agent)) {
-        return "Invalid agent name.";
+export async function launchAgentAtHome(host: string, agent: string, project?: string): Promise<string | null> {
+    const session = project ? `${agent}-${project}` : agent;
+    if (!isSafeSessionName(agent) || !isSafeSessionName(session)) {
+        return "Invalid agent or project name.";
     }
     const script =
         `PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"; ` +
         `tmux has-session -t "=$1" 2>/dev/null && exit 0; ` +
-        `d="$HOME/claude projects/Matilda/agent-$1"; [ -d "$d" ] || d="$HOME"; ` +
+        `d="$HOME/claude projects/Matilda/agent-$2"; [ -d "$d" ] || d="$HOME"; ` +
         `tmux new-session -d -s "$1" -c "$d" && tmux send-keys -t "=$1:" 'unset CLAUDECODE && clauded' Enter`;
-    const args = ["sh", "-c", script, "sh", agent];
+    const args = ["sh", "-c", script, "sh", session, agent];
     const cmd =
         !host || host === LocalHost
             ? shellJoin(args)
             : sshCommand(host, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
     try {
         const result = await getApi().execCommand(cmd);
-        return result.code === 0 ? null : `Couldn't start ${agent} on ${hostDisplayName(host)}.`;
+        return result.code === 0 ? null : `Couldn't start ${session} on ${hostDisplayName(host)}.`;
     } catch {
-        return `Couldn't start ${agent} on ${hostDisplayName(host)}.`;
+        return `Couldn't start ${session} on ${hostDisplayName(host)}.`;
     }
 }
 
@@ -300,11 +305,17 @@ export async function listAgentsAtHome(host: string): Promise<string[] | null> {
     }
 }
 
-/** New session: start `agent` where sessions live (like `launch <agent>`), then attach this pane. */
-export async function launchAndAttach(blockId: string, host: string, agent: string): Promise<string | null> {
-    const err = await launchAgentAtHome(host, agent);
+/** New session: start `agent` (or a copy, `<agent>-<project>`) like `launch`, then attach this pane. */
+export async function launchAndAttach(
+    blockId: string,
+    host: string,
+    agent: string,
+    project?: string
+): Promise<string | null> {
+    const err = await launchAgentAtHome(host, agent, project);
     if (err) {
         return err;
     }
-    return attachPane(blockId, host, agent);
+    return attachPane(blockId, host, project ? `${agent}-${project}` : agent);
 }
+
