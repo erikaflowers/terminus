@@ -10,7 +10,7 @@
 // Older builds wrote an auto-reconnect init script (`exec … tmux new-session -A`); migrateLegacyPane
 // turns those into a remembered session before the pane's shell first starts.
 
-import { getRemoteConfig, globalConfigAtom } from "@/app/store/agents";
+import { getAgentInfo, getRemoteConfig, globalConfigAtom } from "@/app/store/agents";
 import { getApi, getBlockComponentModel, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
 import { RpcApi } from "@/app/store/wshclientapi";
@@ -152,14 +152,30 @@ async function forgetFinishedDroid(blockId: string, droid: SessionTarget) {
     }
 }
 
+/** Header identity for a session: its crew agent (copies like lee-newsite count as Lee), or none. */
+function agentMetaFor(session: string): Record<string, any> {
+    const info = isMatildabot(session) ? null : getAgentInfo(session.split("-")[0]);
+    return {
+        "agent:name": info?.name ?? null,
+        "agent:color": info?.color ?? null,
+        "agent:role": info?.role ?? null,
+    };
+}
+
 async function rememberSession(blockId: string, target: SessionTarget) {
     const meta = WOS.getObjectValue<Block>(WOS.makeORef("block", blockId))?.meta;
-    if (meta?.["session:host"] === target.host && meta?.["session:tmux"] === target.session && !meta?.["session:off"]) {
+    const agent = agentMetaFor(target.session);
+    if (
+        meta?.["session:host"] === target.host &&
+        meta?.["session:tmux"] === target.session &&
+        !meta?.["session:off"] &&
+        (meta?.["agent:name"] ?? null) === agent["agent:name"]
+    ) {
         return;
     }
     await RpcApi.SetMetaCommand(TabRpcClient, {
         oref: WOS.makeORef("block", blockId),
-        meta: { "session:host": target.host, "session:tmux": target.session, "session:off": null },
+        meta: { "session:host": target.host, "session:tmux": target.session, "session:off": null, ...agent },
     });
 }
 
