@@ -277,3 +277,34 @@ export async function launchAgentAtHome(host: string, agent: string): Promise<st
         return `Couldn't start ${agent} on ${hostDisplayName(host)}.`;
     }
 }
+
+/** Agents that can be launched on `host`: its ~/claude projects/Matilda/agent-* folders. Null if unreachable. */
+export async function listAgentsAtHome(host: string): Promise<string[] | null> {
+    const script = `for d in "$HOME/claude projects/Matilda"/agent-*/; do [ -d "$d" ] || continue; b=\${d%/}; echo "\${b##*/agent-}"; done`;
+    const args = ["sh", "-c", script];
+    const cmd =
+        !host || host === LocalHost
+            ? shellJoin(args)
+            : sshCommand(host, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
+    try {
+        const result = await getApi().execCommand(cmd);
+        if (result.code !== 0) {
+            return null;
+        }
+        return (result.stdout ?? "")
+            .split("\n")
+            .map((l) => l.trim().toLowerCase())
+            .filter((n) => isSafeSessionName(n));
+    } catch {
+        return null;
+    }
+}
+
+/** New session: start `agent` where sessions live (like `launch <agent>`), then attach this pane. */
+export async function launchAndAttach(blockId: string, host: string, agent: string): Promise<string | null> {
+    const err = await launchAgentAtHome(host, agent);
+    if (err) {
+        return err;
+    }
+    return attachPane(blockId, host, agent);
+}

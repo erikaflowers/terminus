@@ -17,6 +17,8 @@ import {
     useHomeHost,
     hostDisplayName,
     launchAgentAtHome,
+    launchAndAttach,
+    listAgentsAtHome,
     listSessions,
     RemoteSession,
 } from "./sessionrestore";
@@ -53,16 +55,32 @@ type SessionPickerProps = {
     host: string;
     current?: string;
     onPick: (session: string) => void;
+    onNew?: (agent: string) => Promise<void>;
 };
 
-/** What's running on `host`, freshly listed each time it mounts (it lives inside popovers). */
-export const SessionPicker = ({ host, current, onPick }: SessionPickerProps) => {
+const sectionLabel: React.CSSProperties = {
+    color: "var(--grey-text-color)",
+    fontSize: 10,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+};
+
+/**
+ * Freshly listed each time it mounts (it lives inside popovers): "New session" (agents on `host`
+ * not running yet; one click launches like `launch <agent>` and attaches) and what's running.
+ */
+export const SessionPicker = ({ host, current, onPick, onNew }: SessionPickerProps) => {
     const [sessions, setSessions] = React.useState<RemoteSession[] | null | undefined>(undefined);
+    const [agents, setAgents] = React.useState<string[] | null>(null);
+    const [starting, setStarting] = React.useState<string>(null);
     const refresh = React.useCallback(() => {
         setSessions(undefined);
         listSessions(host).then(setSessions);
-    }, [host]);
+        if (onNew) listAgentsAtHome(host).then(setAgents);
+    }, [host, onNew]);
     React.useEffect(refresh, [refresh]);
+    const running = new Set((sessions ?? []).map((s) => s.name));
+    const launchable = (agents ?? []).filter((a) => !running.has(a));
 
     return (
         <div
@@ -74,13 +92,41 @@ export const SessionPicker = ({ host, current, onPick }: SessionPickerProps) => 
                 background: "var(--block-bg-color)",
                 borderRadius: 6,
                 border: "1px solid rgba(255,255,255,0.1)",
-                width: 240,
+                width: 280,
             }}
         >
+            {onNew && sessions !== undefined && launchable.length > 0 && (
+                <>
+                    <span style={sectionLabel}>New session on {hostDisplayName(host)}</span>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        {launchable.map((a) => (
+                            <button
+                                key={a}
+                                disabled={!!starting}
+                                title={`launch ${a}: start ${a} (clauded) on ${hostDisplayName(host)} and attach`}
+                                onClick={async () => {
+                                    setStarting(a);
+                                    await onNew(a);
+                                    setStarting(null);
+                                }}
+                                style={{
+                                    ...sessionButtonStyle(false),
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 5,
+                                    padding: "3px 8px",
+                                    opacity: starting && starting !== a ? 0.5 : 1,
+                                }}
+                            >
+                                <AgentDot name={a} />
+                                {starting === a ? `starting ${a}…` : a}
+                            </button>
+                        ))}
+                    </div>
+                </>
+            )}
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ color: "var(--main-text-color)", fontSize: 12, fontWeight: 600, flexGrow: 1 }}>
-                    Running on {hostDisplayName(host)}
-                </span>
+                <span style={{ ...sectionLabel, flexGrow: 1 }}>Running on {hostDisplayName(host)}</span>
                 <span
                     title="Refresh"
                     onClick={refresh}
@@ -123,7 +169,7 @@ export const SessionPicker = ({ host, current, onPick }: SessionPickerProps) => 
     );
 };
 
-/** "Pick ▾" button + picker popover; picking attaches `blockId`. */
+/** "Pick ▾" button + picker popover; picking (or starting a new session) attaches `blockId`, then closes. */
 export const PickSessionButton = ({
     blockId,
     host,
@@ -136,21 +182,31 @@ export const PickSessionButton = ({
     current?: string;
     label: React.ReactNode;
     onError?: (msg: string) => void;
-}) => (
-    <Popover placement="bottom-start">
-        <PopoverButton style={{ padding: 0, border: "none", background: "none", minWidth: 0 }}>{label}</PopoverButton>
-        <PopoverContent>
-            <SessionPicker
-                host={host}
-                current={current}
-                onPick={async (name) => {
-                    const err = await attachPane(blockId, host, name);
-                    if (err) onError?.(err);
-                }}
-            />
-        </PopoverContent>
-    </Popover>
-);
+}) => {
+    // The popover has no close API; re-keying it remounts it closed
+    const [gen, setGen] = React.useState(0);
+    const done = (err: string | null) => {
+        if (err) onError?.(err);
+        setGen((g) => g + 1);
+    };
+    const onNew = React.useCallback(
+        async (agent: string) => done(await launchAndAttach(blockId, host, agent)),
+        [blockId, host]
+    );
+    return (
+        <Popover key={gen} placement="bottom-start">
+            <PopoverButton style={{ padding: 0, border: "none", background: "none", minWidth: 0 }}>{label}</PopoverButton>
+            <PopoverContent>
+                <SessionPicker
+                    host={host}
+                    current={current}
+                    onPick={async (name) => done(await attachPane(blockId, host, name))}
+                    onNew={onNew}
+                />
+            </PopoverContent>
+        </Popover>
+    );
+};
 
 /**
  * Top-of-pane bar: shown while the pane remembers a session and isn't attached to it (it doesn't
