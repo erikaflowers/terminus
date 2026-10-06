@@ -14,7 +14,6 @@ import { CollapseSibling, computeCollapse, computeCollapsedFraction, computeExpa
 import { ColorPickerPopover } from "@/app/block/colorpicker";
 import { DurableSessionFlyover } from "@/app/block/durable-session-flyover";
 import { SessionButton } from "@/app/block/sessionbutton";
-import { TmuxDetachButton } from "@/app/block/tmuxdetach";
 import { setAgentPref } from "@/app/store/agents";
 import { ContextMenuModel } from "@/app/store/contextmenu";
 import { atoms, recordTEvent, refocusNode, WOS } from "@/app/store/global";
@@ -372,9 +371,6 @@ const BlockFrame_Header = ({
                     savedHost={blockData?.meta?.["session:host"]}
                     savedSession={blockData?.meta?.["session:tmux"]}
                 />
-            )}
-            {isTerminalBlock && (
-                <TmuxDetachButton blockId={nodeModel.blockId} cwd={(blockData?.meta?.["cmd:cwd"] as string) ?? ""} />
             )}
             {isTerminalBlock && (
                 <span
