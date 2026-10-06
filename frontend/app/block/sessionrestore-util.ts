@@ -125,23 +125,52 @@ export function parseLocalTmuxAttach(cmdline: string): string | null {
     return name && isSafeSessionName(name) ? name : null;
 }
 
+/** Pane ids we accept as file names for the client record (Wave block ids are UUIDs). */
+export function isSafeClientKey(key: string): boolean {
+    return typeof key === "string" && /^[A-Za-z0-9-]{8,64}$/.test(key);
+}
+
 /**
  * The command a pane runs (typed at its prompt) to attach to an EXISTING tmux session: never
- * creates one, and no `exec`, so detaching or a dropped connection lands back in the pane's own
- * shell. `=` makes tmux match the name exactly ("lee" never attaches "lee-identity").
+ * creates one, and no `exec` at the pane's level, so detaching or a dropped connection lands back in
+ * the pane's own shell. `=` makes tmux match the name exactly ("lee" never attaches "lee-identity").
+ * With `clientKey`, it first records its tty in ~/.cache/terminus/<clientKey> on that machine, so
+ * Terminus can later switch exactly this client (`tmux switch-client -c <tty>`).
  */
-export function buildAttachCommand(host: string, session: string): string | null {
-    if (!isSafeSessionName(session)) {
+export function buildAttachCommand(host: string, session: string, clientKey?: string): string | null {
+    if (!isSafeSessionName(session) || (clientKey != null && !isSafeClientKey(clientKey))) {
         return null;
     }
+    const record = clientKey ? `mkdir -p "$HOME/.cache/terminus"; tty > "$HOME/.cache/terminus/$2" 2>/dev/null; ` : "";
+    const script = `PATH="$PATH:${RemotePath}"; ${record}exec tmux attach-session -t "=$1"`;
+    const args = ["sh", "-c", script, "sh", session, ...(clientKey ? [clientKey] : [])];
     if (!host || host === LocalHost) {
-        return shellJoin(["tmux", "attach-session", "-t", "=" + session]);
+        return clientKey ? shellJoin(args) : shellJoin(["tmux", "attach-session", "-t", "=" + session]);
     }
     if (!parseSshCommand("ssh " + shellQuote(host))) {
         return null;
     }
-    const remote = ["sh", "-c", `PATH="$PATH:${RemotePath}"; exec tmux attach-session -t "=$1"`, "sh", session];
-    return sshCommand(host, remote, { tty: true });
+    return sshCommand(host, args, { tty: true });
+}
+
+/** Run on the session's machine: move the client recorded for `clientKey` to `session` (exit 1 if no record). */
+export function buildSwitchClientScriptArgs(clientKey: string, session: string): string[] | null {
+    if (!isSafeClientKey(clientKey) || !isSafeSessionName(session)) {
+        return null;
+    }
+    const script =
+        `PATH="$PATH:${RemotePath}"; c=$(cat "$HOME/.cache/terminus/$1" 2>/dev/null); ` +
+        `[ -n "$c" ] && tmux switch-client -c "$c" -t "=$2"`;
+    return ["sh", "-c", script, "sh", clientKey, session];
+}
+
+/** Run on the session's machine: detach the client recorded for `clientKey` (exit 1 if no record). */
+export function buildDetachClientScriptArgs(clientKey: string): string[] | null {
+    if (!isSafeClientKey(clientKey)) {
+        return null;
+    }
+    const script = `PATH="$PATH:${RemotePath}"; c=$(cat "$HOME/.cache/terminus/$1" 2>/dev/null); [ -n "$c" ] && tmux detach-client -t "$c"`;
+    return ["sh", "-c", script, "sh", clientKey];
 }
 
 /**

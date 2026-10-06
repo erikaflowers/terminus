@@ -1,12 +1,14 @@
 import { execFileSync, execSync } from "child_process";
-import { mkdtempSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, it } from "vitest";
 import { shellJoin, sshCommand } from "@/util/shellquote";
 import {
     buildAttachCommand,
+    buildDetachClientScriptArgs,
     buildListSessionsCommand,
+    buildSwitchClientScriptArgs,
     LocalHost,
     normalizeProjectName,
     parseLegacyInitScript,
@@ -51,13 +53,16 @@ describe("parseSshCommand", () => {
 // Simulate what really runs: the local zsh parses the init script's ssh argv; ssh joins the
 // remote words and the remote /bin/sh parses them. A fake ssh does that, with a fake `tmux`
 // program first on PATH (the script appends Homebrew after the existing PATH).
+let lastFakeHome = "";
 function runWithFakeSsh(script: string): string {
     const dir = mkdtempSync(join(tmpdir(), "srtest-"));
     writeFileSync(join(dir, "tmux"), "#!/bin/sh\nprintf 'TMUX:'; printf '%s|' \"$@\"; echo\n", { mode: 0o755 });
     const fake =
         `ssh() { while [ "$#" -gt 1 ]; do case "$1" in -t|-tt) shift;; -o) shift 2;; *) break;; esac; done; ` +
-        `printf 'HOST=%s\\n' "$1"; shift; PATH="${dir}:/usr/bin:/bin" /bin/sh -c "$*"; }; `;
-    return execFileSync("/bin/zsh", ["-fc", fake + script.replace(/^exec /, "")], { encoding: "utf8" });
+        `printf 'HOST=%s\\n' "$1"; shift; HOME="${dir}" PATH="${dir}:/usr/bin:/bin" /bin/sh -c "$*"; }; `;
+    const out = execFileSync("/bin/zsh", ["-fc", fake + script.replace(/^exec /, "")], { encoding: "utf8" });
+    lastFakeHome = dir;
+    return out;
 }
 
 describe("buildAttachCommand", () => {
@@ -66,6 +71,18 @@ describe("buildAttachCommand", () => {
         expect(cmd.startsWith("ssh -t ")).toBe(true);
         expect(cmd).not.toContain("new-session");
         expect(runWithFakeSsh(cmd)).toBe("HOST=erikflowers@mac-studio-2\nTMUX:attach-session|-t|=siddig|\n");
+    });
+    it("with a client key, records its tty on the remote machine first", () => {
+        const key = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0";
+        const cmd = buildAttachCommand("erikflowers@mac-studio-2", "siddig", key);
+        expect(runWithFakeSsh(cmd)).toBe("HOST=erikflowers@mac-studio-2\nTMUX:attach-session|-t|=siddig|\n");
+        expect(existsSync(join(lastFakeHome, ".cache/terminus", key))).toBe(true);
+        expect(buildAttachCommand("h", "lee", "../../etc/passwd")).toBeNull();
+    });
+    it("switch/detach scripts target the recorded client and refuse bad input", () => {
+        expect(buildSwitchClientScriptArgs("0b1c2d3e-4f50", "lee")).toEqual(expect.arrayContaining(["0b1c2d3e-4f50", "lee"]));
+        expect(buildSwitchClientScriptArgs("0b1c2d3e-4f50", "a;b")).toBeNull();
+        expect(buildDetachClientScriptArgs("x/../y")).toBeNull();
     });
     it("attaches locally without ssh", () => {
         expect(buildAttachCommand(LocalHost, "lee")).toBe("'tmux' 'attach-session' '-t' '=lee'");

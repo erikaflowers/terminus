@@ -21,7 +21,9 @@ import type { ShellIntegrationStatus } from "@/app/view/term/osc-handlers";
 import * as jotai from "jotai";
 import {
     buildAttachCommand,
+    buildDetachClientScriptArgs,
     buildListSessionsCommand,
+    buildSwitchClientScriptArgs,
     LocalHost,
     normalizeProjectName,
     parseLegacyInitScript,
@@ -210,7 +212,7 @@ async function waitForPrompt(blockId: string, timeoutMs: number): Promise<boolea
  * on success, or why not (the pane is busy, bad name). Never creates a session.
  */
 export async function attachPane(blockId: string, host: string, session: string): Promise<string | null> {
-    const cmd = buildAttachCommand(host, session);
+    const cmd = buildAttachCommand(host, session, blockId);
     if (cmd == null) {
         return "Invalid host or session name.";
     }
@@ -224,7 +226,9 @@ export async function attachPane(blockId: string, host: string, session: string)
             return switchAttachedPane(blockId, host, session);
         }
         // Another machine: detach, then attach from the pane's own prompt
-        await sendToTmux(blockId, host, "d");
+        if (!(await runAt(current.host, buildDetachClientScriptArgs(blockId)))) {
+            await sendToTmux(blockId, current.host, ["d"]);
+        }
         if (!(await waitFor(() => globalStore.get(getAttachedAtom(blockId)) == null, 8000))) {
             return "Couldn't detach from the current session.";
         }
@@ -273,13 +277,30 @@ async function getTmuxPrefix(host: string): Promise<string> {
     return byte;
 }
 
-/** Type a tmux key binding into the attached pane: prefix, then `keys` (tmux handles it, the app inside never sees it). */
-async function sendToTmux(blockId: string, host: string, keys: string) {
+/** Run `args` (sh -c …) on `host`; true if it exited 0. */
+async function runAt(host: string, args: string[] | null): Promise<boolean> {
+    if (args == null) return false;
+    const cmd =
+        !host || host === LocalHost
+            ? shellJoin(args)
+            : sshCommand(host, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
+    try {
+        return (await getApi().execCommand(cmd)).code === 0;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Fallback for panes attached before the client record existed: type the tmux prefix, then each
+ * chunk with a pause (tmux drops keys that arrive in the same burst as the prefix/prompt opening).
+ */
+async function sendToTmux(blockId: string, host: string, chunks: string[]) {
     const prefix = await getTmuxPrefix(host);
-    await RpcApi.ControllerInputCommand(TabRpcClient, {
-        blockid: blockId,
-        inputdata64: stringToBase64(prefix + keys),
-    });
+    for (const chunk of [prefix, ...chunks]) {
+        await RpcApi.ControllerInputCommand(TabRpcClient, { blockid: blockId, inputdata64: stringToBase64(chunk) });
+        await new Promise((r) => setTimeout(r, 250));
+    }
 }
 
 /** Pane is attached on `host`: move its tmux client to `session` (exact name) via tmux's command prompt. */
@@ -291,7 +312,10 @@ async function switchAttachedPane(blockId: string, host: string, session: string
     if (sessions != null && !sessions.some((s) => s.name === session)) {
         return `${session} isn't running on ${hostDisplayName(host)}.`;
     }
-    await sendToTmux(blockId, host, `:switch-client -t '=${session}'\r`);
+    // Exact: the tty this pane's attach recorded on that machine. Else type it via tmux's prompt.
+    if (!(await runAt(host, buildSwitchClientScriptArgs(blockId, session)))) {
+        await sendToTmux(blockId, host, [":", `switch-client -t '=${session}'`, "\r"]);
+    }
     globalStore.set(getAttachedAtom(blockId), { host, session });
     globalStore.set(getAttachErrorAtom(blockId), null);
     await rememberSession(blockId, { host, session });
