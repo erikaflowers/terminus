@@ -1,6 +1,6 @@
 # Terminus
 
-**A mission control terminal for AI agent crews.** Built on [Wave Terminal](https://github.com/wavetermdev/waveterm) (forked at v0.14.1). Current release: **0.14.3** (tag `terminus-v0.14.3`, see [RELEASES.md](RELEASES.md)).
+**A mission control terminal for AI agent crews.** Built on [Wave Terminal](https://github.com/wavetermdev/waveterm) (forked at v0.14.1). Current release: **0.15.0** (tag `terminus-v0.15.0`, see [RELEASES.md](RELEASES.md)).
 
 Terminus is an Electron-based terminal multiplexer designed for orchestrating multiple AI agents running in parallel tmux sessions. Each agent gets its own identity, terminal theme, persistent session, and avatar — all managed from a single unified interface.
 
@@ -10,28 +10,38 @@ Terminus is an Electron-based terminal multiplexer designed for orchestrating mu
 
 ### Agent System
 
-Every terminal pane can be assigned to an agent. The header shows the agent's name, role, avatar, and a colored accent border. Switching agents is instant via header dropdown — the pane restarts into that agent's tmux session automatically using ForceRestart (kills PTY, spawns fresh shell, auto-attaches tmux).
+Every terminal pane can be assigned to an agent. The header shows the agent's name, role, avatar, and a colored accent border. Switching agents is instant via header dropdown — the pane restarts as a clean shell and attaches that agent's tmux session on the home machine (see Home Sessions).
 
 - 16 pre-defined agents with unique colors, roles, and avatars
 - Per-agent terminal themes and background colors
 - Per-agent preferences persist across sessions
-- Re-selecting the same agent forces reconnect (broken pipe recovery)
 - Local and remote (SSH) tmux session support with auto-detected tmux paths
+
+### Home Sessions (0.15.0)
+
+The Mac Mini is home: it holds every tmux/agent session, and each Terminus is a window onto it. Home is Crew's remote host (Crew settings).
+
+- **Nothing connects by itself.** A pane remembers the session it last showed. While it isn't attached, a bar offers `● heavy @ julians-mac-mini  [Attach] [Pick ▾] ×`. Attach types an attach-only command at the pane's prompt; Ctrl-b d (or a dropped connection) leaves you in the pane's own shell, and Enter never reconnects.
+- **Session picker** (the header's server button, or Pick ▾): everything running on home. Dot = agent color, filled = someone is attached (number = clients), outline = this pane's last session.
+  - **New session:** agents (home's `agent-*` folders) not running yet; one click runs `launch <agent>` there and attaches.
+  - **`+`** on a running agent: a second copy, `<agent>-<project>`.
+  - **🤖 matildabot:** a numbered throwaway droid for a one-off chore; `/exit` and it's gone.
+- **New panes and splits** offer `Pick a session on <home> ▾`; × hides it for that pane.
 
 ### Panes Follow You (0.14.2 / 0.14.3)
 
 Your work lives in tmux on your machines; Terminus panes are windows onto it. These features make a pane's session portable:
 
 - **Move a pane to another tab or window.** Right-click a pane header (or its cog): **Send to Tab ▸** [tabs in this window…, New Tab], **Send to Window ▸** [each other window ▸ its tabs…, New Tab], **Send to New Window**. It's a real move: the pane keeps its id, so its process (shell, ssh, tmux) keeps running untouched. Nothing reconnects. A tab emptied by a move closes (and so does its window, if it was the last tab).
-- **Session Restore.** A pane that has run `ssh` shows a link button in its header. Pick the host (aliases like `macstudio` are expanded) and one of that host's live tmux sessions, then **Remember**. From then on every fresh shell in that pane (app launch, Cmd-Q and relaunch, Enter after a dropped connection) runs `ssh -t <host> … tmux new-session -A -s <session>` and attaches or creates it. **Reconnect now** / **Forget** live in the same popover.
-- **Clone Workspace to another Mac.** Right-click a tab: **Clone Workspace to ▸** [your other Macs online in Tailscale], **Copy Workspace Snapshot**, **Open Workspace from Clipboard**. The snapshot carries the window's tabs, the exact split layout and sizes, and each pane's settings. It's delivered over ssh into Terminus's `workspace-inbox` on the other Mac, which asks "Open workspace from …?" (also at launch, if it arrived while Terminus was closed). Remembered sessions reconnect; a session hosted on the receiving Mac attaches locally.
+- **Session Restore** (0.14.2) was replaced in 0.15.0 by Home Sessions: panes remember their session but no longer reconnect on their own.
+- **Clone Workspace to another Mac.** Right-click a tab: **Clone Workspace to ▸** [your other Macs online in Tailscale], **Copy Workspace Snapshot**, **Open Workspace from Clipboard**. The snapshot carries the window's tabs, the exact split layout and sizes, and each pane's settings. It's delivered over ssh into Terminus's `workspace-inbox` on the other Mac, which asks "Open workspace from …?" (also at launch, if it arrived while Terminus was closed). Remembered sessions arrive as the pane's session bar (nothing auto-connects); a session hosted on the receiving Mac is offered locally.
   - On recent macOS, Terminus's own `ssh` needs the **Local Network** permission once per Mac; the prompt names "ssh-keygen wrapper".
   - Sending uses key-based ssh between your Macs (Tailscale names), with the ssh user taken from your remembered sessions.
 
 ### Reliability
 
 - **No more mouse floods.** When tmux/ssh dies with mouse reporting on, Terminus resets stale terminal modes when the shell prompt returns, when a pane's process starts or stops, and after history replay, so scrolls are no longer typed into zsh as escape codes.
-- Agent panes attach-or-create their tmux session (`new-session -A`); a dead session leaves the pane "done", and Enter re-attaches.
+- Attaching never creates a session (exact `=name` match), and a pane always falls back to its own local shell.
 - Hardened after a full code review (Fable 5.1 + Opus 5.5 verification, [docs/REVIEW-2026-09-26.md](docs/REVIEW-2026-09-26.md)): shell quoting everywhere (`frontend/util/shellquote.ts`), web blocks can't capture screen/audio, cloud sync is allowlisted and never uploads secrets, Dev Servers only kills the process it shows, and more.
 - **Privacy:** no telemetry or pings to Wave's servers; auto-update is off (there is no Terminus update feed).
 

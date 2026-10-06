@@ -77,9 +77,9 @@ Go Backend (wavesrv — SQLite, SSH, terminal emulation)
 - **Shell strings:** every value interpolated into a shell command goes through `frontend/util/shellquote.ts` (`shellQuote`, `shellJoin`, `sshCommand`); tmux session names must pass `isSafeSessionName`. `getApi().execCommand` is `/bin/sh -c` with a 10 s timeout.
 - **Never delete a block to move it.** Use the `detach` layout action (`wcore.MoveBlockToTab`); `delete`/`closeNode` calls `DeleteBlock`, which kills the process.
 - **Terminus launched from Finder has no `LANG`:** tmux (and others) mangle control characters in output. Use printable separators when parsing command output.
-- **tmux attach:** use `new-session -A` (attach-or-create) with `exec`, so a dead session leaves the pane "done" and Enter re-attaches.
+- **tmux attach (0.15.0, Home Sessions):** never write an auto-reconnect init script and never `new-session -A`/`exec` for attaching. Use `attachPane()` in `frontend/app/block/sessionrestore.ts`: it types an attach-only command (`tmux attach-session -t =<name>`, via ssh to home) at the pane's prompt, so detaching returns to the pane's own shell. Sessions are started on home (`launchAgentAtHome`, dotfiles `matildabot`). Home = Crew's `remoteHost`.
 - Fork meta keys live in `pkg/waveobj/wtypemeta.go` (`agent:*`, `session:*`, `frame:collapsed`/`prevsize`, `term:bgcolor`); run `task generate` after adding one.
 
 ## Status
 
-Current release **0.14.3** (`terminus-v0.14.3`, 2026-09-27). Stable; on hold. What's next: ROADMAP.md → "Next". Code review and remaining lows: `docs/REVIEW-2026-09-26.md`.
+Current release **0.15.0** (`terminus-v0.15.0`, 2026-10-06): Home Sessions (the Mini is the session server). What's next: ROADMAP.md → "Next". Code review and remaining lows: `docs/REVIEW-2026-09-26.md`.
