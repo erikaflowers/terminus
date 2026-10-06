@@ -1,7 +1,7 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { attachPane, getHomeHost, resetPaneState } from "@/app/block/sessionrestore";
+import { attachPane, getAttachedAtom, getHomeHost, resetPaneState } from "@/app/block/sessionrestore";
 import { atoms, getApi, WOS } from "@/app/store/global";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
@@ -491,6 +491,16 @@ async function forceRestartWithAgent(blockId: string, agentName: string | null):
         return;
     }
     const home = getHomeHost();
+    // Already attached on home: switch the tmux client in place (instant, no restart)
+    const attached = globalStore.get(getAttachedAtom(blockId));
+    if (session && attached?.host === home) {
+        await RpcApi.SetMetaCommand(TabRpcClient, {
+            oref: WOS.makeORef("block", blockId),
+            meta: { "cmd:initscript.zsh": null, "session:off": null },
+        });
+        await attachPane(blockId, home, session);
+        return;
+    }
     await RpcApi.SetMetaCommand(TabRpcClient, {
         oref: WOS.makeORef("block", blockId),
         meta: {

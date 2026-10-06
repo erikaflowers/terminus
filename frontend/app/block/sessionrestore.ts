@@ -214,8 +214,20 @@ export async function attachPane(blockId: string, host: string, session: string)
     if (cmd == null) {
         return "Invalid host or session name.";
     }
-    if (globalStore.get(getAttachedAtom(blockId)) != null) {
-        return "This pane is already attached. Detach first (Ctrl-b d).";
+    const current = globalStore.get(getAttachedAtom(blockId));
+    if (current != null) {
+        if (current.host === host && current.session === session) {
+            return null;
+        }
+        // Already in tmux on that machine: switch this client in place (no reconnect)
+        if (current.host === host) {
+            return switchAttachedPane(blockId, host, session);
+        }
+        // Another machine: detach, then attach from the pane's own prompt
+        await sendToTmux(blockId, host, "d");
+        if (!(await waitFor(() => globalStore.get(getAttachedAtom(blockId)) == null, 8000))) {
+            return "Couldn't detach from the current session.";
+        }
     }
     if (!(await waitForPrompt(blockId, 3000))) {
         return "This pane is busy. Finish what's running, then attach.";
@@ -227,6 +239,62 @@ export async function attachPane(blockId: string, host: string, session: string)
         blockid: blockId,
         inputdata64: stringToBase64(cmd + "\r"),
     });
+    return null;
+}
+
+async function waitFor(cond: () => boolean, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (cond()) return true;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    return cond();
+}
+
+const prefixCache = new Map<string, string>();
+
+/** The tmux prefix on `host` as the byte a terminal sends ("C-b" → \x02); Ctrl-b if it can't be read. */
+async function getTmuxPrefix(host: string): Promise<string> {
+    if (prefixCache.has(host)) {
+        return prefixCache.get(host);
+    }
+    let key = "C-b";
+    const args = ["sh", "-c", `PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"; tmux show -gv prefix 2>/dev/null`];
+    const cmd =
+        !host || host === LocalHost
+            ? shellJoin(args)
+            : sshCommand(host, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
+    try {
+        const out = ((await getApi().execCommand(cmd)).stdout ?? "").trim();
+        if (/^C-[a-z]$/.test(out)) key = out;
+    } catch {}
+    const byte = String.fromCharCode(key.charCodeAt(2) - 96);
+    prefixCache.set(host, byte);
+    return byte;
+}
+
+/** Type a tmux key binding into the attached pane: prefix, then `keys` (tmux handles it, the app inside never sees it). */
+async function sendToTmux(blockId: string, host: string, keys: string) {
+    const prefix = await getTmuxPrefix(host);
+    await RpcApi.ControllerInputCommand(TabRpcClient, {
+        blockid: blockId,
+        inputdata64: stringToBase64(prefix + keys),
+    });
+}
+
+/** Pane is attached on `host`: move its tmux client to `session` (exact name) via tmux's command prompt. */
+async function switchAttachedPane(blockId: string, host: string, session: string): Promise<string | null> {
+    if (!isSafeSessionName(session)) {
+        return "Invalid session name.";
+    }
+    const sessions = await listSessions(host);
+    if (sessions != null && !sessions.some((s) => s.name === session)) {
+        return `${session} isn't running on ${hostDisplayName(host)}.`;
+    }
+    await sendToTmux(blockId, host, `:switch-client -t '=${session}'\r`);
+    globalStore.set(getAttachedAtom(blockId), { host, session });
+    globalStore.set(getAttachErrorAtom(blockId), null);
+    await rememberSession(blockId, { host, session });
     return null;
 }
 
