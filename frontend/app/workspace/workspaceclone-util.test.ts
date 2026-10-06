@@ -62,11 +62,26 @@ describe("pane meta", () => {
         });
         expect(portablePaneMeta({ "cmd:initscript.zsh": "x" })).toEqual({ "cmd:initscript.zsh": "x" });
     });
-    it("reconnects over ssh elsewhere, attaches locally when the session host is this machine", () => {
+    it("never adds an init script: the session arrives as a memory, local when it lives here", () => {
         const remote = adaptPaneMetaForHere(portablePaneMeta(session), new Set(["mac-studio-2"]));
-        expect(remote["cmd:initscript.zsh"]).toMatch(/^exec ssh -t 'juliansiddig@julians-mac-mini' /);
+        expect(remote["cmd:initscript.zsh"]).toBeUndefined();
+        expect(remote["session:host"]).toBe("juliansiddig@julians-mac-mini");
         const local = adaptPaneMetaForHere(portablePaneMeta(session), new Set(["julians-mac-mini"]));
-        expect(local["cmd:initscript.zsh"]).toBe("exec 'tmux' 'new-session' '-A' '-s' 'lee'\n");
+        expect(local["cmd:initscript.zsh"]).toBeUndefined();
+        expect(local["session:host"]).toBe("local");
+    });
+    it("a sender's local session points back at the sender", () => {
+        const fromStudio = { "session:host": "local", "session:tmux": "siddig" };
+        expect(adaptPaneMetaForHere(fromStudio, new Set(["eriks-macbook-air-2"]), "erikflowers@mac-studio-2")).toEqual({
+            "session:host": "erikflowers@mac-studio-2",
+            "session:tmux": "siddig",
+        });
+        // opened on the sender itself: stays local
+        expect(adaptPaneMetaForHere(fromStudio, new Set(["mac-studio-2"]), "erikflowers@mac-studio-2")).toEqual(fromStudio);
+    });
+    it("turns an old auto-reconnect init script into a remembered session", () => {
+        const old = { view: "term", "cmd:initscript.zsh": "exec '/opt/homebrew/bin/tmux' 'new-session' '-A' '-s' 'heavy'\n" };
+        expect(portablePaneMeta(old)).toEqual({ view: "term", "session:host": "local", "session:tmux": "heavy" });
     });
     it("leaves unsafe sessions alone", () => {
         const bad = { "session:host": "h", "session:tmux": "a;b" };

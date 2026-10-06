@@ -4,8 +4,8 @@
 // Pure helpers for Clone Workspace: turn a tab's layout tree into a portable snapshot tree, adapt
 // pane settings for the machine that opens it, and work out which of your machines to send to.
 
-import { buildSessionRestoreScript } from "@/app/block/sessionrestore-util";
-import { isSafeSessionName, shellJoin } from "@/util/shellquote";
+import { LocalHost, parseLegacyInitScript } from "@/app/block/sessionrestore-util";
+import { isSafeSessionName } from "@/util/shellquote";
 
 export const WorkspaceSnapshotType = "terminus-workspace";
 
@@ -57,13 +57,21 @@ export function collectLeafBlockIds(node: any, acc: string[] = []): string[] {
     return acc;
 }
 
-/** Pane settings worth carrying to another machine (init scripts are rebuilt on arrival for remembered sessions). */
+/**
+ * Pane settings worth carrying to another machine. An old auto-reconnect init script is never
+ * carried: it becomes a remembered session (the receiving pane offers it instead of running it).
+ */
 export function portablePaneMeta(meta: Record<string, any>): Record<string, any> {
     const out: Record<string, any> = {};
-    const hasSession = !!(meta?.["session:host"] && meta?.["session:tmux"]);
+    const legacy = parseLegacyInitScript(meta?.["cmd:initscript.zsh"]);
+    const hasSession = !!(meta?.["session:host"] && meta?.["session:tmux"]) || !!legacy;
     for (const [k, v] of Object.entries(meta ?? {})) {
         if (hasSession && k.startsWith("cmd:initscript")) continue;
         out[k] = v;
+    }
+    if (legacy && !(meta?.["session:host"] && meta?.["session:tmux"])) {
+        out["session:host"] = legacy.host;
+        out["session:tmux"] = legacy.session;
     }
     return out;
 }
@@ -74,19 +82,24 @@ export function hostLabel(host: string): string {
 }
 
 /**
- * Adapt a pane for the machine opening the snapshot: a remembered ssh+tmux session reconnects
- * (ssh), unless its host IS this machine, in which case it attaches to tmux locally.
+ * Adapt a pane for the machine opening the snapshot. Panes never connect on their own: a remembered
+ * session arrives as a memory (the pane offers it), with its host rewritten to "local" when the
+ * session lives on the receiving machine, or from "local" to the sender when it doesn't.
  */
-export function adaptPaneMetaForHere(meta: Record<string, any>, localNames: Set<string>): Record<string, any> {
+export function adaptPaneMetaForHere(
+    meta: Record<string, any>,
+    localNames: Set<string>,
+    senderHost?: string
+): Record<string, any> {
     const host = meta?.["session:host"];
     const session = meta?.["session:tmux"];
     if (!host || !session || !isSafeSessionName(session)) {
         return meta;
     }
-    const script = localNames.has(hostLabel(host))
-        ? `exec ${shellJoin(["tmux", "new-session", "-A", "-s", session])}\n`
-        : buildSessionRestoreScript(host, session);
-    return script ? { ...meta, "cmd:initscript.zsh": script } : meta;
+    if (host === LocalHost) {
+        return senderHost && !localNames.has(hostLabel(senderHost)) ? { ...meta, "session:host": senderHost } : meta;
+    }
+    return localNames.has(hostLabel(host)) ? { ...meta, "session:host": LocalHost } : meta;
 }
 
 export type TailnetMachine = { label: string; hostName: string; os: string; online: boolean };

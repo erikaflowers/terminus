@@ -152,6 +152,7 @@ const (
 	MetaKey_SessionClear                     = "session:*"
 	MetaKey_SessionHost                      = "session:host"
 	MetaKey_SessionTmux                      = "session:tmux"
+	MetaKey_SessionOff                       = "session:off"
 
 	MetaKey_WebZoom                          = "web:zoom"
 	MetaKey_WebHideNav                       = "web:hidenav"

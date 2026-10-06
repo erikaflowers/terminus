@@ -1,10 +1,10 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import { attachPane, getHomeHost } from "@/app/block/sessionrestore";
 import { BlockNodeModel } from "@/app/block/blocktypes";
 import {
     AgentColorTable,
-    buildTmuxAttachInitScript,
     buildTmuxCommand,
     getAgentDir,
     getAgentInfo,
@@ -309,8 +309,10 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
         const info = getAgentInfo(agentKey);
         const agentName = info?.name ?? agentKey;
         const sessionName = agentKey.toLowerCase();
-        const initScript = buildTmuxAttachInitScript(sessionName, getAgentDir(sessionName));
-        if (!initScript) return;
+        if (!isSafeSessionName(sessionName)) return;
+        const home = getHomeHost();
+        // A plain shell that remembers the session; attaching types the attach command at its prompt,
+        // so detaching leaves a usable local shell (no auto-reconnect init script)
         const blockDef: BlockDef = {
             meta: {
                 view: "term",
@@ -319,10 +321,12 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
                 "agent:color": info?.color ?? null,
                 "agent:role": info?.role ?? null,
                 "term:theme": info?.defaultTheme ?? null,
-                "cmd:initscript.zsh": initScript,
+                "session:host": home,
+                "session:tmux": sessionName,
             },
         };
-        await createBlock(blockDef);
+        const blockId = await createBlock(blockDef);
+        await attachPane(blockId, home, sessionName);
     }, []);
 
     const handleLaunch = React.useCallback(
