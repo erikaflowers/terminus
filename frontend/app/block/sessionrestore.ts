@@ -125,8 +125,28 @@ export function noteCommandDone(blockId: string, exitCode: number | null) {
 
 /** The pane's shell drew its prompt: whatever was attached has detached. */
 export function notePrompt(blockId: string) {
-    if (globalStore.get(getAttachedAtom(blockId)) != null) {
-        globalStore.set(getAttachedAtom(blockId), null);
+    const was = globalStore.get(getAttachedAtom(blockId));
+    if (was == null) {
+        return;
+    }
+    globalStore.set(getAttachedAtom(blockId), null);
+    if (isMatildabot(was.session)) {
+        void forgetFinishedDroid(blockId, was);
+    }
+}
+
+/** A droid that was /exit-ed is gone for good: forget it (the pane offers the picker again). Detached ones stay. */
+async function forgetFinishedDroid(blockId: string, droid: SessionTarget) {
+    const sessions = await listSessions(droid.host);
+    if (sessions == null || sessions.some((s) => s.name === droid.session)) {
+        return;
+    }
+    const meta = WOS.getObjectValue<Block>(WOS.makeORef("block", blockId))?.meta;
+    if (meta?.["session:tmux"] === droid.session) {
+        await RpcApi.SetMetaCommand(TabRpcClient, {
+            oref: WOS.makeORef("block", blockId),
+            meta: { "session:host": null, "session:tmux": null },
+        });
     }
 }
 
@@ -299,7 +319,7 @@ export async function listAgentsAtHome(host: string): Promise<string[] | null> {
         return (result.stdout ?? "")
             .split("\n")
             .map((l) => l.trim().toLowerCase())
-            .filter((n) => isSafeSessionName(n));
+            .filter((n) => isSafeSessionName(n) && n !== MatildabotName); // droids are numbered, see launchBotAndAttach
     } catch {
         return null;
     }
@@ -319,3 +339,33 @@ export async function launchAndAttach(
     return attachPane(blockId, host, project ? `${agent}-${project}` : agent);
 }
 
+
+/** Matilda's throwaway utility droids: sessions matildabot-NNN, all launched from agent-matildabot. */
+export const MatildabotName = "matildabot";
+
+export function isMatildabot(session: string): boolean {
+    return /^matildabot-\d+$/.test(session ?? "");
+}
+
+/**
+ * Start the next numbered droid where sessions live (dotfiles' `matildabot --detach`, which picks
+ * matildabot-NNN and runs claude as the session itself, so /exit ends it), then attach this pane.
+ */
+export async function launchBotAndAttach(blockId: string, host: string): Promise<string | null> {
+    const args = ["sh", "-c", `"$HOME/claude projects/dotfiles/scripts/matildabot" --detach`];
+    const cmd =
+        !host || host === LocalHost
+            ? shellJoin(args)
+            : sshCommand(host, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
+    let name: string;
+    try {
+        const result = await getApi().execCommand(cmd);
+        name = (result.stdout ?? "").trim().split("\n").pop();
+        if (result.code !== 0 || !isMatildabot(name)) {
+            return `Couldn't start a Matildabot on ${hostDisplayName(host)} (is dotfiles' scripts/matildabot there?).`;
+        }
+    } catch {
+        return `Couldn't start a Matildabot on ${hostDisplayName(host)}.`;
+    }
+    return attachPane(blockId, host, name);
+}

@@ -18,7 +18,9 @@ import {
     hostDisplayName,
     launchAgentAtHome,
     launchAndAttach,
+    launchBotAndAttach,
     listAgentsAtHome,
+    MatildabotName,
     listSessions,
     normalizeProjectName,
     RemoteSession,
@@ -38,6 +40,10 @@ export const sessionButtonStyle = (primary: boolean): React.CSSProperties => ({
 
 const isCrewAgent = (name: string) => Object.prototype.hasOwnProperty.call(AgentColorTable, name?.toLowerCase());
 
+// Droids aren't crew (no AgentColorTable entry, so Crew doesn't offer them as an agent)
+const MatildabotColor = "#FACC15";
+const dotColor = (name: string) => (name === MatildabotName ? MatildabotColor : getAgentColor(name));
+
 const AgentDot = ({ name, attached }: { name: string; attached?: boolean }) => (
     <span
         style={{
@@ -46,8 +52,8 @@ const AgentDot = ({ name, attached }: { name: string; attached?: boolean }) => (
             height: 8,
             borderRadius: 4,
             flexShrink: 0,
-            background: attached ? (getAgentColor(name) ?? "var(--accent-color)") : "transparent",
-            border: `1.5px solid ${getAgentColor(name) ?? "var(--grey-text-color)"}`,
+            background: attached ? (dotColor(name) ?? "var(--accent-color)") : "transparent",
+            border: `1.5px solid ${dotColor(name) ?? "var(--grey-text-color)"}`,
         }}
     />
 );
@@ -57,6 +63,7 @@ type SessionPickerProps = {
     current?: string;
     onPick: (session: string) => void;
     onNew?: (agent: string, project?: string) => Promise<void>;
+    onBot?: () => Promise<void>;
 };
 
 const sectionLabel: React.CSSProperties = {
@@ -70,7 +77,7 @@ const sectionLabel: React.CSSProperties = {
  * Freshly listed each time it mounts (it lives inside popovers): "New session" (agents on `host`
  * not running yet; one click launches like `launch <agent>` and attaches) and what's running.
  */
-export const SessionPicker = ({ host, current, onPick, onNew }: SessionPickerProps) => {
+export const SessionPicker = ({ host, current, onPick, onNew, onBot }: SessionPickerProps) => {
     const [sessions, setSessions] = React.useState<RemoteSession[] | null | undefined>(undefined);
     const [agents, setAgents] = React.useState<string[] | null>(null);
     const [starting, setStarting] = React.useState<string>(null);
@@ -108,10 +115,32 @@ export const SessionPicker = ({ host, current, onPick, onNew }: SessionPickerPro
                 width: 280,
             }}
         >
-            {onNew && sessions !== undefined && launchable.length > 0 && (
+            {onNew && sessions !== undefined && (launchable.length > 0 || onBot) && (
                 <>
                     <span style={sectionLabel}>New session on {hostDisplayName(host)}</span>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        {onBot && (
+                            <button
+                                disabled={!!starting}
+                                title={`A throwaway utility droid (matildabot-NNN) for a one-off chore; /exit and it's gone`}
+                                onClick={async () => {
+                                    setStarting(MatildabotName);
+                                    await onBot();
+                                    setStarting(null);
+                                }}
+                                style={{
+                                    ...sessionButtonStyle(false),
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 5,
+                                    padding: "3px 8px",
+                                    opacity: starting && starting !== MatildabotName ? 0.5 : 1,
+                                }}
+                            >
+                                <span>🤖</span>
+                                {starting === MatildabotName ? "starting droid…" : "matildabot"}
+                            </button>
+                        )}
                         {launchable.map((a) => (
                             <button
                                 key={a}
@@ -261,6 +290,7 @@ export const PickSessionButton = ({
         async (agent: string, project?: string) => done(await launchAndAttach(blockId, host, agent, project)),
         [blockId, host]
     );
+    const onBot = React.useCallback(async () => done(await launchBotAndAttach(blockId, host)), [blockId, host]);
     return (
         <Popover key={gen} placement="bottom-start">
             <PopoverButton style={{ padding: 0, border: "none", background: "none", minWidth: 0 }}>{label}</PopoverButton>
@@ -270,6 +300,7 @@ export const PickSessionButton = ({
                     current={current}
                     onPick={async (name) => done(await attachPane(blockId, host, name))}
                     onNew={onNew}
+                    onBot={onBot}
                 />
             </PopoverContent>
         </Popover>
