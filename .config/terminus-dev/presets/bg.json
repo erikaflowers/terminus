@@ -1,0 +1,10 @@
+{
+  "bg@black": {
+    "display:name": "Black",
+    "display:order": 1,
+    "bg:*": true,
+    "bg": "#000000",
+    "bg:opacity": 1.0,
+    "bg:blendmode": "normal"
+  }
+}
