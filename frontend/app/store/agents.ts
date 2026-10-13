@@ -1,10 +1,9 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { attachPane, getAttachedAtom, getHomeHost, resetPaneState } from "@/app/block/sessionrestore";
-import { atoms, getApi, WOS } from "@/app/store/global";
-import { RpcApi } from "@/app/store/wshclientapi";
-import { TabRpcClient } from "@/app/store/wshrpcutil";
+import { getHomeHost } from "@/app/block/sessionrestore";
+import { getApi } from "@/app/store/global";
+import { LocalHost } from "@/app/block/sessionrestore-util";
 import { isSafeSessionName, shellJoin, sshCommand } from "@/util/shellquote";
 import { atom, type PrimitiveAtom } from "jotai";
 import { globalStore } from "./jotaiStore";
@@ -138,6 +137,49 @@ async function loadAvatarDataUrl(filePath: string): Promise<string | null> {
         });
     avatarLoadingPromises.set(filePath, promise);
     return promise;
+}
+
+// Portraits live in the Matilda repo on home (where the sessions are); this Mac may not have it.
+const PortraitsAtHome = "claude projects/Matilda/portraits";
+
+/**
+ * An agent's portrait as a data URL: from Crew's agents path on this Mac if set and present, else
+ * from home (the Mini) over ssh. Null if neither has it. Failures from home aren't cached, so a
+ * dropped connection doesn't hide the avatar for the rest of the session.
+ */
+async function loadAgentAvatar(name: string): Promise<string | null> {
+    if (!name || !isSafeSessionName(name)) {
+        return null;
+    }
+    const file = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase() + ".jpg";
+    const local = getAvatarPath(name);
+    if (local) {
+        const url = await loadAvatarDataUrl(local);
+        if (url) return url;
+    }
+    const home = getHomeHost();
+    if (!home || home === LocalHost) {
+        return loadAvatarDataUrl(`${getApi().getHomeDir()}/${PortraitsAtHome}/${file}`);
+    }
+    const key = `${home}:${file}`;
+    if (avatarCache.get(key)) {
+        return avatarCache.get(key);
+    }
+    const args = ["sh", "-c", `base64 < "$HOME/${PortraitsAtHome}/$1"`, "sh", file];
+    try {
+        const result = await getApi().execCommand(
+            sshCommand(home, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] })
+        );
+        const b64 = (result.stdout ?? "").replace(/\s+/g, "");
+        if (result.code !== 0 || !b64) {
+            return null;
+        }
+        const url = `data:image/jpeg;base64,${b64}`;
+        avatarCache.set(key, url);
+        return url;
+    } catch {
+        return null;
+    }
 }
 
 function getAgentInfo(name: string): AgentInfo | null {
@@ -292,6 +334,40 @@ async function setAgentPref(agentName: string, key: string, value: string | null
         }
         allPrefs[name] = prefs;
     });
+}
+
+/**
+ * Pane meta for showing `agentName` (or no agent): name, color and role, plus the agent's saved
+ * theme and background (else its crew theme). First saves the outgoing agent's theme and background
+ * so each agent keeps its own look. Leaving an agent for a non-crew session returns to the default look.
+ */
+async function agentIdentityMeta(prev: Record<string, any> | undefined, agentName: string | null) {
+    await loadAgentPreferences();
+    const outgoing = (prev?.["agent:name"] as string) || null;
+    if (outgoing) {
+        for (const key of ["term:theme", "term:bgcolor"]) {
+            if (prev?.[key]) {
+                await setAgentPref(outgoing, key, prev[key]);
+            }
+        }
+    }
+    const info = agentName ? getAgentInfo(agentName) : null;
+    if (!info) {
+        return {
+            "agent:name": null,
+            "agent:color": null,
+            "agent:role": null,
+            ...(outgoing ? { "term:theme": null, "term:bgcolor": null } : {}),
+        };
+    }
+    const saved = getAgentPrefs(info.name);
+    return {
+        "agent:name": info.name,
+        "agent:color": info.color,
+        "agent:role": info.role,
+        "term:theme": saved["term:theme"] ?? info.defaultTheme ?? null,
+        "term:bgcolor": saved["term:bgcolor"] ?? null,
+    };
 }
 
 function getGlobalConfig(): GlobalConfig {
@@ -477,55 +553,11 @@ function getAgentDir(agentKey: string): string {
     return agentsDir ? `${agentsDir}/agent-${agentKey.toLowerCase()}` : "";
 }
 
-// --- Tmux Session Switching via ForceRestart ---
-
-/**
- * Point a pane at an agent (or at nothing): restart it as a clean local shell that remembers the
- * agent's session where sessions live, then attach by typing at its prompt. Detaching leaves the
- * local shell; nothing reconnects on its own (see block/sessionrestore.ts).
- */
-async function forceRestartWithAgent(blockId: string, agentName: string | null): Promise<void> {
-    const tabId = globalStore.get(atoms.staticTabId);
-    const session = agentName ? agentName.toLowerCase() : null;
-    if (session && !isSafeSessionName(session)) {
-        return;
-    }
-    const home = getHomeHost();
-    // Already attached on home: switch the tmux client in place (instant, no restart)
-    const attached = globalStore.get(getAttachedAtom(blockId));
-    if (session && attached?.host === home) {
-        await RpcApi.SetMetaCommand(TabRpcClient, {
-            oref: WOS.makeORef("block", blockId),
-            meta: { "cmd:initscript.zsh": null, "session:off": null },
-        });
-        await attachPane(blockId, home, session);
-        return;
-    }
-    await RpcApi.SetMetaCommand(TabRpcClient, {
-        oref: WOS.makeORef("block", blockId),
-        meta: {
-            "cmd:initscript.zsh": null,
-            "session:host": session ? home : null,
-            "session:tmux": session,
-            "session:off": null,
-        },
-    });
-    resetPaneState(blockId);
-    await RpcApi.ControllerResyncCommand(TabRpcClient, {
-        tabid: tabId,
-        blockid: blockId,
-        forcerestart: true,
-    });
-    if (session) {
-        await attachPane(blockId, home, session);
-    }
-}
-
 export {
     AgentColorTable,
+    agentIdentityMeta,
     agentsAtom,
     buildTmuxCommand,
-    forceRestartWithAgent,
     getAgentColor,
     getAgentDir,
     getAgentInfo,
@@ -542,6 +574,7 @@ export {
     getTmuxPath,
     globalConfigAtom,
     loadAgentPreferences,
+    loadAgentAvatar,
     loadAvatarDataUrl,
     resolveRemoteTmuxPath,
     setAgentPref,

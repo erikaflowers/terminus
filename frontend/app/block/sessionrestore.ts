@@ -10,7 +10,7 @@
 // Older builds wrote an auto-reconnect init script (`exec … tmux new-session -A`); migrateLegacyPane
 // turns those into a remembered session before the pane's shell first starts.
 
-import { getAgentInfo, getRemoteConfig, globalConfigAtom } from "@/app/store/agents";
+import { agentIdentityMeta, getAgentInfo, getRemoteConfig, globalConfigAtom } from "@/app/store/agents";
 import { getApi, getBlockComponentModel, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
 import { RpcApi } from "@/app/store/wshclientapi";
@@ -152,30 +152,28 @@ async function forgetFinishedDroid(blockId: string, droid: SessionTarget) {
     }
 }
 
-/** Header identity for a session: its crew agent (copies like lee-newsite count as Lee), or none. */
-function agentMetaFor(session: string): Record<string, any> {
-    const info = isMatildabot(session) ? null : getAgentInfo(session.split("-")[0]);
-    return {
-        "agent:name": info?.name ?? null,
-        "agent:color": info?.color ?? null,
-        "agent:role": info?.role ?? null,
-    };
+/** The crew agent a session belongs to (copies like lee-newsite count as Lee), or null. */
+function agentNameFor(session: string): string | null {
+    return isMatildabot(session) ? null : (getAgentInfo(session.split("-")[0])?.name ?? null);
 }
 
+/** Remember the pane's session, and when its agent changes, wear that agent's identity and look. */
 async function rememberSession(blockId: string, target: SessionTarget) {
     const meta = WOS.getObjectValue<Block>(WOS.makeORef("block", blockId))?.meta;
-    const agent = agentMetaFor(target.session);
+    const agentName = agentNameFor(target.session);
+    const sameAgent = (meta?.["agent:name"] ?? null) === agentName;
     if (
         meta?.["session:host"] === target.host &&
         meta?.["session:tmux"] === target.session &&
         !meta?.["session:off"] &&
-        (meta?.["agent:name"] ?? null) === agent["agent:name"]
+        sameAgent
     ) {
         return;
     }
+    const identity = sameAgent ? {} : await agentIdentityMeta(meta, agentName);
     await RpcApi.SetMetaCommand(TabRpcClient, {
         oref: WOS.makeORef("block", blockId),
-        meta: { "session:host": target.host, "session:tmux": target.session, "session:off": null, ...agent },
+        meta: { "session:host": target.host, "session:tmux": target.session, "session:off": null, ...identity },
     });
 }
 

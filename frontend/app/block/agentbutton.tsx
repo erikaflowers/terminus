@@ -1,21 +1,23 @@
 // Copyright 2026, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { getAgentInfo, globalConfigAtom, loadAvatarDataUrl } from "@/app/store/agents";
-import { recordTEvent } from "@/app/store/global";
+import { useHomeHost } from "@/app/block/sessionrestore";
+import { getAgentInfo, globalConfigAtom, loadAgentAvatar } from "@/app/store/agents";
 import * as util from "@/util/util";
 import * as jotai from "jotai";
 import * as React from "react";
 
 interface AgentButtonProps {
     agentName: string;
-    changeAgentModalAtom: jotai.PrimitiveAtom<boolean>;
 }
+
+// The pane's agent badge. Display only: the agent follows the attached tmux session
+// (sessionrestore.ts rememberSession), so the session picker is the one place to choose.
 
 export const AgentButton = React.memo(
     React.forwardRef<HTMLDivElement, AgentButtonProps>(
-        ({ agentName, changeAgentModalAtom }: AgentButtonProps, ref) => {
-            const [, setAgentModalOpen] = jotai.useAtom(changeAgentModalAtom);
+        ({ agentName }: AgentButtonProps, ref) => {
+            const homeHost = useHomeHost();
             const agentsPath = jotai.useAtomValue(globalConfigAtom).agentsPath;
             const agentInfo = agentName ? getAgentInfo(agentName) : null;
             const color = agentInfo?.color ?? "var(--grey-text-color)";
@@ -25,23 +27,20 @@ export const AgentButton = React.memo(
 
             React.useEffect(() => {
                 setAvatarDataUrl(null);
-                if (agentInfo?.avatarPath) {
-                    loadAvatarDataUrl(agentInfo.avatarPath).then((url) => {
-                        if (url) setAvatarDataUrl(url);
-                    });
-                }
-            }, [agentInfo?.avatarPath, agentsPath]);
-
-            const clickHandler = function () {
-                recordTEvent("action:other", { "action:type": "agentdropdown", "action:initiator": "mouse" });
-                setAgentModalOpen(true);
-            };
+                if (!agentInfo) return;
+                let live = true;
+                loadAgentAvatar(agentInfo.name).then((url) => {
+                    if (live && url) setAvatarDataUrl(url);
+                });
+                return () => {
+                    live = false;
+                };
+            }, [agentInfo?.name, agentsPath, homeHost]);
 
             return (
                 <div
                     ref={ref}
-                    className="group flex items-center flex-nowrap overflow-hidden min-w-0 font-normal text-primary rounded-sm hover:bg-highlightbg cursor-pointer gap-[6px] px-[4px]"
-                    onClick={clickHandler}
+                    className="group flex items-center flex-nowrap overflow-hidden min-w-0 font-normal text-primary rounded-sm gap-[6px] px-[4px]"
                     title={titleText}
                 >
                     {avatarDataUrl ? (

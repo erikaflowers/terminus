@@ -4,8 +4,7 @@
 import { BlockModel } from "@/app/block/block-model";
 import { BlockFrame_Header } from "@/app/block/blockframe-header";
 import { blockViewToIcon, getViewIconElem } from "@/app/block/blockutil";
-import { ChangeAgentBlockModal } from "@/app/modals/agenttypeahead";
-import { atoms, getSettingsKeyAtom, useBlockAtom, WOS } from "@/app/store/global";
+import { atoms, getSettingsKeyAtom, WOS } from "@/app/store/global";
 import { useTabModel } from "@/app/store/tab-model";
 import { WorkspaceLayoutModel } from "@/app/workspace/workspace-layout-model";
 import { ErrorBoundary } from "@/element/errorboundary";
@@ -91,10 +90,6 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
     const viewIconUnion = util.useAtomValueSafe(viewModel?.viewIcon) ?? blockViewToIcon(blockData?.meta?.view);
     const customBg = util.useAtomValueSafe(viewModel?.blockBg);
     const manageAgent = util.useAtomValueSafe(viewModel?.manageAgent);
-    const changeAgentModalAtom = useBlockAtom(nodeModel.blockId, "changeAgent", () => {
-        return jotai.atom(false);
-    }) as jotai.PrimitiveAtom<boolean>;
-    const agentModalOpen = jotai.useAtomValue(changeAgentModalAtom);
     const isMagnified = jotai.useAtomValue(nodeModel.isMagnified);
     const isEphemeral = jotai.useAtomValue(nodeModel.isEphemeral);
     const [magnifiedBlockBlurAtom] = React.useState(() => getSettingsKeyAtom("window:magnifiedblockblurprimarypx"));
@@ -112,11 +107,7 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
     const agentColor = blockData?.meta?.["agent:color"] as string;
     const previewElem = <div className="block-frame-preview">{viewIconElem}</div>;
     const headerElem = (
-        <BlockFrame_Header
-            {...props}
-            agentBtnRef={agentBtnRef}
-            changeAgentModalAtom={changeAgentModalAtom}
-        />
+        <BlockFrame_Header {...props} agentBtnRef={agentBtnRef} />
     );
     const headerElemNoView = React.cloneElement(headerElem, { viewModel: null });
     return (
@@ -152,15 +143,6 @@ const BlockFrame_Default_Component = (props: BlockFrameProps) => {
                 {noHeader || <ErrorBoundary fallback={headerElemNoView}>{headerElem}</ErrorBoundary>}
                 {preview ? previewElem : children}
             </div>
-            {preview || viewModel == null || !agentModalOpen ? null : (
-                <ChangeAgentBlockModal
-                    blockId={nodeModel.blockId}
-                    nodeModel={nodeModel}
-                    blockRef={blockModel?.blockRef}
-                    changeAgentModalAtom={changeAgentModalAtom}
-                    agentBtnRef={agentBtnRef}
-                />
-            )}
         </div>
     );
 };

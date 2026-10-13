@@ -275,10 +275,8 @@ const BlockFrame_Header = ({
     viewModel,
     preview,
     agentBtnRef,
-    changeAgentModalAtom,
     error,
 }: BlockFrameProps & {
-    changeAgentModalAtom?: jotai.PrimitiveAtom<boolean>;
     error?: Error;
 }) => {
     const [blockData] = WOS.useWaveObjectValue<Block>(WOS.makeORef("block", nodeModel.blockId));
@@ -350,13 +348,8 @@ const BlockFrame_Header = ({
                     </div>
                 </>
             )}
-            {manageAgent && changeAgentModalAtom && (
-                <AgentButton
-                    ref={agentBtnRef}
-                    key="agentbutton"
-                    agentName={blockData?.meta?.["agent:name"] as string}
-                    changeAgentModalAtom={changeAgentModalAtom}
-                />
+            {manageAgent && (
+                <AgentButton ref={agentBtnRef} key="agentbutton" agentName={blockData?.meta?.["agent:name"] as string} />
             )}
             {isTerminalBlock && currentBgColor && (
                 <ColorPickerPopover
