@@ -334,40 +334,173 @@ async function setAgentPref(agentName: string, key: string, value: string | null
         }
         allPrefs[name] = prefs;
     });
+    if (AgentLookKeys.includes(key)) {
+        await saveLookAtHome(name, key, value);
+    }
+}
+
+// --- Agent looks, kept on home ---
+//
+// Each agent's pane look (theme, background) lives in one file on home (the Mini), so every Mac
+// and every pane shows an agent the same way. Edits write through to it at once; panes read it when
+// they show an agent and about once a minute. agent-preferences.json keeps a local copy for offline.
+
+const AgentLookKeys = ["term:theme", "term:bgcolor"];
+const LooksFileAtHome = ".config/terminus/agent-looks.json";
+const LooksRefreshMs = 30_000;
+
+// Read-merge-write under a lock, so two Macs saving at once can't drop each other's change.
+// Refuses to touch a file it can't parse. An empty value means "cleared": kept, so a Mac that
+// still has an old value doesn't seed it back up.
+const SaveLookScript = `import json, os, sys, fcntl
+p = os.path.expanduser("~/${LooksFileAtHome}")
+os.makedirs(os.path.dirname(p), exist_ok=True)
+with open(p + ".lock", "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    d = json.load(open(p)) if os.path.exists(p) else {}
+    for i in range(1, len(sys.argv) - 2, 3):
+        agent, key, value = sys.argv[i:i + 3]
+        d.setdefault(agent, {})[key] = value
+    t = p + ".tmp"
+    with open(t, "w") as f:
+        json.dump(d, f, indent=2, sort_keys=True)
+    os.replace(t, p)
+`;
+
+function homeCommand(args: string[]): string {
+    const home = getHomeHost();
+    return !home || home === LocalHost
+        ? shellJoin(args)
+        : sshCommand(home, args, { sshOpts: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] });
+}
+
+/** Write looks to home: triples of agent, key, value (empty value = cleared). */
+async function saveLooksAtHome(triples: string[]): Promise<boolean> {
+    try {
+        const result = await getApi().execCommand(homeCommand(["/usr/bin/python3", "-c", SaveLookScript, ...triples]));
+        if (result.code !== 0) {
+            console.error("[agent-looks] saving on home failed", result.stderr);
+        }
+        return result.code === 0;
+    } catch (e) {
+        console.error("[agent-looks] saving on home failed", e);
+        return false;
+    }
+}
+
+async function saveLookAtHome(agent: string, key: string, value: string | null): Promise<void> {
+    await saveLooksAtHome([agent.toLowerCase(), key, value ?? ""]);
+    looksFetchedAt = 0;
+}
+
+let looksFetchedAt = 0;
+let looksFetch: Promise<void> | null = null;
+
+/**
+ * Pull every agent's look from home into the prefs (home wins). Looks this Mac has that home
+ * doesn't yet are pushed up once, so nothing already set is lost. Shared and rate-limited; on
+ * failure the local copy stands.
+ */
+function refreshLooksFromHome(force = false): Promise<void> {
+    if (looksFetch) {
+        return looksFetch;
+    }
+    if (!force && Date.now() - looksFetchedAt < LooksRefreshMs) {
+        return Promise.resolve();
+    }
+    looksFetch = (async () => {
+        await loadAgentPreferences();
+        let homeLooks: Record<string, AgentPrefs>;
+        try {
+            const result = await getApi().execCommand(
+                homeCommand(["sh", "-c", `cat "$HOME/${LooksFileAtHome}" 2>/dev/null; true`])
+            );
+            if (result.code !== 0) {
+                return;
+            }
+            const text = (result.stdout ?? "").trim();
+            homeLooks = text ? JSON.parse(text) : {};
+        } catch (e) {
+            console.warn("[agent-looks] couldn't read looks from home", e);
+            return;
+        }
+        looksFetchedAt = Date.now();
+        const seed: string[] = [];
+        const changed: [string, string, string | null][] = [];
+        for (const agent of Object.keys(AgentColorTable)) {
+            const local = agentPrefsMap.get(agent) ?? {};
+            const remote = homeLooks?.[agent] ?? {};
+            for (const key of AgentLookKeys) {
+                if (key in remote) {
+                    if ((local[key] || null) !== (remote[key] || null)) {
+                        changed.push([agent, key, remote[key] || null]);
+                    }
+                } else if (local[key]) {
+                    seed.push(agent, key, local[key]);
+                }
+            }
+        }
+        if (seed.length > 0) {
+            await saveLooksAtHome(seed);
+        }
+        if (changed.length > 0) {
+            await updatePrefsFile((allPrefs) => {
+                for (const [agent, key, value] of changed) {
+                    const prefs = { ...(allPrefs[agent] ?? {}) };
+                    if (value == null) {
+                        delete prefs[key];
+                    } else {
+                        prefs[key] = value;
+                    }
+                    allPrefs[agent] = prefs;
+                }
+            });
+        }
+    })().finally(() => {
+        looksFetch = null;
+    });
+    return looksFetch;
+}
+
+/** An agent's look: its saved theme and background, else its crew theme. */
+function agentLookMeta(info: AgentInfo): Record<string, any> {
+    const saved = getAgentPrefs(info.name);
+    return {
+        "term:theme": saved["term:theme"] ?? info.defaultTheme ?? null,
+        "term:bgcolor": saved["term:bgcolor"] ?? null,
+    };
 }
 
 /**
- * Pane meta for showing `agentName` (or no agent): name, color and role, plus the agent's saved
- * theme and background (else its crew theme). First saves the outgoing agent's theme and background
- * so each agent keeps its own look. Leaving an agent for a non-crew session returns to the default look.
+ * Pane meta for showing `agentName` (or no agent): name, color, role and the agent's look, fresh
+ * from home. Leaving an agent for a non-crew session returns to the default look.
  */
 async function agentIdentityMeta(prev: Record<string, any> | undefined, agentName: string | null) {
-    await loadAgentPreferences();
-    const outgoing = (prev?.["agent:name"] as string) || null;
-    if (outgoing) {
-        for (const key of ["term:theme", "term:bgcolor"]) {
-            if (prev?.[key]) {
-                await setAgentPref(outgoing, key, prev[key]);
-            }
-        }
-    }
     const info = agentName ? getAgentInfo(agentName) : null;
     if (!info) {
         return {
             "agent:name": null,
             "agent:color": null,
             "agent:role": null,
-            ...(outgoing ? { "term:theme": null, "term:bgcolor": null } : {}),
+            ...(prev?.["agent:name"] ? { "term:theme": null, "term:bgcolor": null } : {}),
         };
     }
-    const saved = getAgentPrefs(info.name);
-    return {
-        "agent:name": info.name,
-        "agent:color": info.color,
-        "agent:role": info.role,
-        "term:theme": saved["term:theme"] ?? info.defaultTheme ?? null,
-        "term:bgcolor": saved["term:bgcolor"] ?? null,
-    };
+    await refreshLooksFromHome(true);
+    return { "agent:name": info.name, "agent:color": info.color, "agent:role": info.role, ...agentLookMeta(info) };
+}
+
+/**
+ * Keep a pane that shows an agent in step with that agent's look on home (an edit on another Mac
+ * shows up here within a minute). Returns the meta to apply, or null if it already matches.
+ */
+async function syncedLookMeta(meta: Record<string, any> | undefined): Promise<Record<string, any> | null> {
+    const info = meta?.["agent:name"] ? getAgentInfo(meta["agent:name"]) : null;
+    if (!info) {
+        return null;
+    }
+    await refreshLooksFromHome();
+    const look = agentLookMeta(info);
+    return AgentLookKeys.some((k) => (meta?.[k] ?? null) !== (look[k] ?? null)) ? look : null;
 }
 
 function getGlobalConfig(): GlobalConfig {
@@ -556,6 +689,7 @@ function getAgentDir(agentKey: string): string {
 export {
     AgentColorTable,
     agentIdentityMeta,
+    AgentLookKeys,
     agentsAtom,
     buildTmuxCommand,
     getAgentColor,
@@ -580,5 +714,6 @@ export {
     setAgentPref,
     setGlobalConfig,
     setRemoteConfig,
+    syncedLookMeta,
 };
 export type { AgentInfo, GlobalConfig };

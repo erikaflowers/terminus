@@ -2,21 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useHomeHost } from "@/app/block/sessionrestore";
-import { getAgentInfo, globalConfigAtom, loadAgentAvatar } from "@/app/store/agents";
+import { getAgentInfo, globalConfigAtom, loadAgentAvatar, syncedLookMeta } from "@/app/store/agents";
+import { WOS } from "@/app/store/global";
+import { RpcApi } from "@/app/store/wshclientapi";
+import { TabRpcClient } from "@/app/store/wshrpcutil";
 import * as util from "@/util/util";
 import * as jotai from "jotai";
 import * as React from "react";
 
 interface AgentButtonProps {
+    blockId: string;
     agentName: string;
 }
+
+const LookSyncMs = 60_000;
 
 // The pane's agent badge. Display only: the agent follows the attached tmux session
 // (sessionrestore.ts rememberSession), so the session picker is the one place to choose.
 
 export const AgentButton = React.memo(
     React.forwardRef<HTMLDivElement, AgentButtonProps>(
-        ({ agentName }: AgentButtonProps, ref) => {
+        ({ blockId, agentName }: AgentButtonProps, ref) => {
             const homeHost = useHomeHost();
             const agentsPath = jotai.useAtomValue(globalConfigAtom).agentsPath;
             const agentInfo = agentName ? getAgentInfo(agentName) : null;
@@ -36,6 +42,21 @@ export const AgentButton = React.memo(
                     live = false;
                 };
             }, [agentInfo?.name, agentsPath, homeHost]);
+
+            // Wear the agent's look as saved on home, now and about once a minute
+            React.useEffect(() => {
+                if (!agentInfo) return;
+                const sync = async () => {
+                    const meta = WOS.getObjectValue<Block>(WOS.makeORef("block", blockId))?.meta;
+                    const look = await syncedLookMeta(meta);
+                    if (look) {
+                        await RpcApi.SetMetaCommand(TabRpcClient, { oref: WOS.makeORef("block", blockId), meta: look });
+                    }
+                };
+                sync();
+                const timer = setInterval(sync, LookSyncMs);
+                return () => clearInterval(timer);
+            }, [blockId, agentInfo?.name, homeHost]);
 
             return (
                 <div

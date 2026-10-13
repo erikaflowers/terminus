@@ -8,9 +8,9 @@ import {
     buildTmuxCommand,
     getAgentDir,
     getAgentInfo,
-    getAgentsPath,
+    agentIdentityMeta,
     globalConfigAtom,
-    loadAvatarDataUrl,
+    loadAgentAvatar,
     resolveRemoteTmuxPath,
     setRemoteConfig,
     type AgentInfo,
@@ -241,6 +241,7 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
     const [loading, setLoading] = React.useState(false);
     const [avatars, setAvatars] = React.useState<Record<string, string | null>>({});
     const agentsPath = jotai.useAtomValue(globalConfigAtom, { store: globalStore }).agentsPath;
+    const homeHost = jotai.useAtomValue(globalConfigAtom, { store: globalStore }).remoteHost;
 
     const refreshSessions = React.useCallback(async () => {
         setLoading(true);
@@ -277,26 +278,15 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
         setLoading(false);
     }, []);
 
-    // Load avatars on mount (using dynamic repo base path)
+    // Load avatars on mount (this Mac's agents path, else home)
     React.useEffect(() => {
         const loadAvatars = async () => {
-            const agentsDir = getAgentsPath();
-            if (!agentsDir) return;
-            console.log("[crew] loading avatars from:", agentsDir + "/portraits/");
-            const loaded: Record<string, string | null> = {};
-            let successCount = 0;
-            for (const key of Object.keys(AgentColorTable)) {
-                const capitalized = key.charAt(0).toUpperCase() + key.slice(1);
-                const avatarPath = `${agentsDir}/portraits/${capitalized}.jpg`;
-                const result = await loadAvatarDataUrl(avatarPath);
-                loaded[key] = result;
-                if (result) successCount++;
-            }
-            console.log(`[crew] avatars loaded: ${successCount}/${Object.keys(AgentColorTable).length}`);
-            setAvatars(loaded);
+            const keys = Object.keys(AgentColorTable);
+            const urls = await Promise.all(keys.map((key) => loadAgentAvatar(key)));
+            setAvatars(Object.fromEntries(keys.map((key, i) => [key, urls[i]])));
         };
         loadAvatars();
-    }, [agentsPath]);
+    }, [agentsPath, homeHost]);
 
     // Initial load + polling
     React.useEffect(() => {
@@ -317,10 +307,7 @@ const CrewView: React.FC<ViewComponentProps<CrewViewModel>> = ({ model }) => {
             meta: {
                 view: "term",
                 controller: "shell",
-                "agent:name": agentName,
-                "agent:color": info?.color ?? null,
-                "agent:role": info?.role ?? null,
-                "term:theme": info?.defaultTheme ?? null,
+                ...(await agentIdentityMeta(undefined, agentName)),
                 "session:host": home,
                 "session:tmux": sessionName,
             },

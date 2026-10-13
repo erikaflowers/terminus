@@ -3,6 +3,7 @@
 
 import { WaveAIModel } from "@/app/aipanel/waveai-model";
 import { BlockNodeModel } from "@/app/block/blocktypes";
+import { setAgentPref } from "@/app/store/agents";
 import { appHandleKeyDown } from "@/app/store/keymodel";
 import { modalsModel } from "@/app/store/modalmodel";
 import type { TabModel } from "@/app/store/tab-model";
@@ -839,6 +840,11 @@ export class TermViewModel implements ViewModel {
             oref: WOS.makeORef("block", this.blockId),
             meta: { "term:theme": themeName },
         });
+        // a pane showing an agent: this is now that agent's theme everywhere
+        const agentName = globalStore.get(this.blockAtom)?.meta?.["agent:name"] as string;
+        if (agentName) {
+            fireAndForget(() => setAgentPref(agentName, "term:theme", themeName));
+        }
     }
 
     async forceRestartController() {

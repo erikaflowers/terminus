@@ -349,7 +349,12 @@ const BlockFrame_Header = ({
                 </>
             )}
             {manageAgent && (
-                <AgentButton ref={agentBtnRef} key="agentbutton" agentName={blockData?.meta?.["agent:name"] as string} />
+                <AgentButton
+                    ref={agentBtnRef}
+                    key="agentbutton"
+                    blockId={nodeModel.blockId}
+                    agentName={blockData?.meta?.["agent:name"] as string}
+                />
             )}
             {isTerminalBlock && currentBgColor && (
                 <ColorPickerPopover
