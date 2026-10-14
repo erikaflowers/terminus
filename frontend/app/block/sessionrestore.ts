@@ -11,7 +11,7 @@
 // turns those into a remembered session before the pane's shell first starts.
 
 import { agentIdentityMeta, getAgentInfo, getRemoteConfig, globalConfigAtom } from "@/app/store/agents";
-import { getApi, getBlockComponentModel, WOS } from "@/app/store/global";
+import { atoms, getApi, getBlockComponentModel, WOS } from "@/app/store/global";
 import { globalStore } from "@/app/store/jotaiStore";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
@@ -258,6 +258,28 @@ export async function attachPane(blockId: string, host: string, session: string)
         inputdata64: stringToBase64(cmd + "\r"),
     });
     return null;
+}
+
+/**
+ * Resume: restart the pane's shell (clears a hung or broken connection) and attach the session it
+ * remembers. The session itself lives on home and isn't touched. Returns null, else why not.
+ */
+export async function reattachPane(blockId: string): Promise<string | null> {
+    const meta = WOS.getObjectValue<Block>(WOS.makeORef("block", blockId))?.meta;
+    const host = meta?.["session:host"] as string;
+    const session = meta?.["session:tmux"] as string;
+    if (!host || !session) {
+        return "This pane doesn't remember a session. Pick one.";
+    }
+    resetPaneState(blockId);
+    await RpcApi.ControllerResyncCommand(TabRpcClient, {
+        tabid: globalStore.get(atoms.staticTabId),
+        blockid: blockId,
+        forcerestart: true,
+    });
+    const err = await attachPane(blockId, host, session);
+    globalStore.set(getAttachErrorAtom(blockId), err);
+    return err;
 }
 
 async function waitFor(cond: () => boolean, timeoutMs: number): Promise<boolean> {

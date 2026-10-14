@@ -13,7 +13,7 @@ import {
 import { CollapseSibling, computeCollapse, computeCollapsedFraction, computeExpand } from "@/app/block/collapsemath";
 import { ColorPickerPopover } from "@/app/block/colorpicker";
 import { DurableSessionFlyover } from "@/app/block/durable-session-flyover";
-import { SessionButton } from "@/app/block/sessionbutton";
+import { ReattachButton, SessionButton } from "@/app/block/sessionbutton";
 import { setAgentPref } from "@/app/store/agents";
 import { ContextMenuModel } from "@/app/store/contextmenu";
 import { atoms, recordTEvent, refocusNode, WOS } from "@/app/store/global";
@@ -365,6 +365,13 @@ const BlockFrame_Header = ({
             )}
             {isTerminalBlock && (
                 <SessionButton
+                    blockId={nodeModel.blockId}
+                    savedHost={blockData?.meta?.["session:host"]}
+                    savedSession={blockData?.meta?.["session:tmux"]}
+                />
+            )}
+            {isTerminalBlock && (
+                <ReattachButton
                     blockId={nodeModel.blockId}
                     savedHost={blockData?.meta?.["session:host"]}
                     savedSession={blockData?.meta?.["session:tmux"]}
